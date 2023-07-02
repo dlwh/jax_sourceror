@@ -1,3 +1,5 @@
+from functools import partial
+
 from jax_automin.interpreter import automin_function
 import jax
 import jax.numpy as jnp
@@ -12,7 +14,7 @@ def test_jaxpr_to_source_simple():
     source = automin_function(f, jnp.array([1, 2, 3]))
 
     assert source == """def f(a):
-    b = (a + 1)
+    b = a + 1
     return b"""
 
 
@@ -53,8 +55,90 @@ def test_slice_squeeze():
     check_roundtrip(f2, jnp.arange(4 * 5 * 6).reshape(4, 5, 6))
 
 
+def test_pseudo_sliding_window_attn_block():
+    block_len = 64
+    seq_len = 128
+    batch = 4
+    num_heads = 2
+    embed_size = 32
+    num_layers = 2
+    head_size = 16
+
+    def block(x):
+        query_block = x
+        weights = jnp.sum(query_block, axis=3)  # [batch, len, num_heads]
+        weights = jax.lax.broadcast_in_dim(weights, (batch, block_len, num_heads, block_len),
+                                           (0, 1, 2))  # [batch, len, num_heads, len]
+        # weights = with_sharding_constraint(weights, P('data', None, None, None))
+        # without "bias", no boom
+        bias = jnp.ones(block_len).broadcast_in_dim((batch, block_len, num_heads, block_len), (1,))
+        weights = weights + bias
+        return jnp.einsum('bqhk,bkhd->bqhd', weights, query_block).astype(query_block.dtype)
+
+    x = jnp.arange(batch * block_len * num_heads * head_size).reshape(batch, block_len, num_heads, head_size).astype(jnp.float32)
+
+    f2 = check_roundtrip(block, x)
 
 
+def test_pseudo_sliding_window_attention():
+    block_len = 64
+    seq_len = 128
+    batch = 4
+    num_heads = 2
+    embed_size = 32
+    num_layers = 2
+    head_size = 16
+    def pseudo_sliding_window_attention(x):
+        # (this is not attention, but is minimized from attn)
+        # dims are [batch, len, num_heads, head_dim]
+        # having num_heads is important. num_heads = 1, no boom
+        def block(block_idx):
+            query_block = jax.lax.dynamic_slice_in_dim(x, block_idx, block_len, axis=1)
+            weights = jnp.sum(query_block, axis=3)  # [batch, len, num_heads]
+            weights = jax.lax.broadcast_in_dim(weights, (batch, block_len, num_heads, block_len),
+                                               (0, 1, 2))  # [batch, len, num_heads, len]
+            # weights = with_sharding_constraint(weights, P('data', None, None, None))
+            # without "bias", no boom
+            bias = jnp.ones(block_len).broadcast_in_dim((batch, block_len, num_heads, block_len), (1,))
+            weights = weights + bias
+            return jnp.einsum('bqhk,bkhd->bqhd', weights, query_block).astype(query_block.dtype)
+
+        num_blocks = seq_len // block_len
+        blocked_attn = jax.lax.map(block, jnp.arange(0, num_blocks))  # [num_blocks, batch, len, num_heads, head_dim]
+        blocked_attn = jnp.concatenate(blocked_attn, axis=1)
+
+        return blocked_attn
+
+    def fwd(params, x):
+        @partial(jax.checkpoint, prevent_cse=False)
+        def layer(x, params):
+            qkv, o = params
+            y = jnp.einsum('bte,hde->bthd', x, qkv)
+            y = pseudo_sliding_window_attention(y)
+            z = jnp.einsum('bthd,hde->bte', y, o)
+            return z, None
+
+
+        x, _ = jax.lax.scan(layer, x, params)
+
+        return x
+
+    def loss_fn(params, x):
+        x = fwd(params, x)
+        l = jnp.mean(x)
+        return l
+
+    def grad_fn(params, x):
+        loss, grad = jax.value_and_grad(loss_fn)(params, x)
+        return loss, grad
+
+    qkv = jnp.ones((num_layers, num_heads, head_size, embed_size), dtype=jnp.bfloat16)
+    o = jnp.ones((num_layers, num_heads, head_size, embed_size), dtype=jnp.bfloat16)
+    x = jnp.ones((batch, seq_len, embed_size), dtype=jnp.bfloat16)
+
+    params = (qkv, o)
+
+    f2 = check_roundtrip(grad_fn, params, x)
 
 
 
