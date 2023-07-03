@@ -83,7 +83,6 @@ def eval_jaxpr(jaxpr, env):
     # sub in any constants for outvars
     outvars = tuple(read_or_self(var) for var in jaxpr.outvars)
 
-
     return jaxpr.replace(eqns=out_eqns, outvars=outvars)
 
 
@@ -197,5 +196,25 @@ constant_fold_blacklist = {
     'broadcast',
 }
 
+skolem_id = 0
+
+def _sourcify_scan(eqn):
+    nonlocal skolem_id
+    assert eqn.primitive.name == 'scan'
+
+    jaxpr = eqn.params['jaxpr']
+    jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
+
+    fn_name = f"scan_fn_{skolem_id}"
+    fn_source = jaxpr_to_source(jaxpr, fn_name)
+
+    reverse = eqn.params['reverse']
+    length = eqn.params['length']
+    unroll = eqn.params['unroll']
+
+    f"""
+{fn_source}
+
+    """
 
 
