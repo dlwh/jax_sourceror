@@ -36,7 +36,16 @@ def test_jaxpr_to_source_matmul():
 def check_roundtrip(f, *args, **kwargs):
     source = automin_function(f, *args, **kwargs)
     f2 = _exec_sandboxed(source, f.__name__)
-    assert jnp.alltrue(f(*args, **kwargs) == f2(*args, **kwargs))
+
+    f_results = f(*args, **kwargs)
+    f2_results = f2(*args, **kwargs)
+    if isinstance(f_results, tuple):
+        assert isinstance(f2_results, tuple)
+        assert len(f_results) == len(f2_results)
+        for a, b in zip(f_results, f2_results):
+            assert jnp.alltrue(a == b)
+    else:
+        assert jnp.alltrue(f_results == f2_results)
     return f2
 
 
@@ -78,6 +87,26 @@ def test_pseudo_sliding_window_attn_block():
     x = jnp.arange(batch * block_len * num_heads * head_size).reshape(batch, block_len, num_heads, head_size).astype(jnp.float32)
 
     f2 = check_roundtrip(block, x)
+
+
+
+def test_scan():
+    def scanfn(x, y):
+        return x + y, x * y
+
+    x = jnp.arange(10)
+    y = jnp.arange(10)
+
+    def f(x, y):
+        return jax.lax.scan(scanfn, x, y)
+
+    f2 = check_roundtrip(f, x, y)
+
+    assert jnp.alltrue(f(x, y)[0] == f2(x, y)[0])
+    assert jnp.alltrue(f(x, y)[1] == f2(x, y)[1])
+
+
+
 
 
 def test_pseudo_sliding_window_attention():

@@ -33,13 +33,16 @@ def jaxpr_to_py_ast(jaxpr, fn_name="function"):
     for eqn in jaxpr.eqns:
         prim = str(eqn.primitive)
         if prim in prim_to_python:
-            op = prim_to_python[prim](eqn)
-            stmts.append(op)
+            eqn_stmts = prim_to_python[prim](eqn)
         else:
-            stmts.append(dumb_fn(prim)(eqn))
+            eqn_stmts = dumb_fn(prim)(eqn)
+
+        if isinstance(eqn_stmts, list):
+            stmts.extend(eqn_stmts)
+        else:
+            stmts.append(eqn_stmts)
 
     # Generate return statement
-    # returns = ', '.join([str(var) for var in jaxpr.outvars])
     if len(jaxpr.outvars) == 1:
         returns = ast.Name(id=str(jaxpr.outvars[0]), ctx=ast.Load())
     else:
@@ -53,9 +56,9 @@ def constant_fold_jaxpr(jaxpr: jax.core.Jaxpr):
     """
     Given a jaxpr, return a new jaxpr with all constant folding done.
     """
-    return eval_jaxpr(jaxpr, {})
+    return partial_eval_jaxpr(jaxpr, {})
 
-def eval_jaxpr(jaxpr, env):
+def partial_eval_jaxpr(jaxpr, env):
     env = env.copy()
     new_eqns = []
 
@@ -87,7 +90,7 @@ def eval_jaxpr(jaxpr, env):
         else:
             new_eqns.append(eqn)
 
-    # now that we've evalled everything, inline all the constants
+    # now that we've evaled everything, inline all the constants
     out_eqns = []
     for eqn in new_eqns:
         eqn = eqn.replace(invars=tuple(read_or_self(var) for var in eqn.invars))
@@ -104,7 +107,7 @@ def _eval_eqn(eqn, vals):
         assert eqn.primitive.call_primitive == True
         assert eqn.primitive.map_primitive == False
 
-        out = eval_jaxpr(eqn.params['call_jaxpr'].jaxpr, { var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals) })
+        out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr, {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
     else:
         out = eqn.primitive.bind(*vals, **eqn.params)
     return out
@@ -118,29 +121,23 @@ def _astify_dot_general(eqn):
 
     # recognize simple matmul case
     if d == (((1,), (0,)), ((), ())) and precision == None and preferred_element_type == None:
-        # return f"{eqn.outvars[0]} = jax.numpy.matmul({x}, {y})"
-        return ast.Assign(targets=_astify_outvars(eqn.outvars), value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='matmul', ctx=ast.Load()), args=[_astify_var(x), _astify_var(y)], keywords=[]))
+        return ast.Assign(targets=_astify_outvars(eqn.outvars), value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='matmul', ctx=ast.Load()), args=[_astify_atom(x), _astify_atom(y)], keywords=[]))
 
-    # return f"{eqn.outvars[0]} = jax.lax.dot_general({x}, {y}, {d}, {precision}, {preferred_element_type})"
-    return ast.Assign(targets=_astify_outvars(eqn.outvars), value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.lax', ctx=ast.Load()), attr='dot_general', ctx=ast.Load()), args=[_astify_var(x), _astify_var(y), _astify_var(d), _astify_var(precision), _astify_var(preferred_element_type)], keywords=[]))
+    return ast.Assign(targets=_astify_outvars(eqn.outvars), value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.lax', ctx=ast.Load()), attr='dot_general', ctx=ast.Load()), args=[_astify_atom(x), _astify_atom(y), _astify_atom(d), _astify_atom(precision), _astify_atom(preferred_element_type)], keywords=[]))
 
 def _sourcify_dynamic_slice(eqn):
     sliced = eqn.invars[0]
-    # invars = ', '.join(_astify_var(var) for var in eqn.invars[1:])
-    # outvars = ', '.join(repr(var) for var in eqn.outvars)
-    # params = ', '.join(f"{k}={v}" for k, v in eqn.params.items())
-    # return f"{outvars} = jax.lax.dynamic_slice({sliced}, ({invars},), {params})"
     # now we use ast
     outvars = _astify_outvars(eqn.outvars)
-    invars = ast.Tuple(elts=[_astify_var(var) for var in eqn.invars[1:]], ctx=ast.Load())
-    params = [ast.keyword(arg=k, value=_astify_var(v)) for k, v in eqn.params.items()]
+    invars = ast.Tuple(elts=[_astify_atom(var) for var in eqn.invars[1:]], ctx=ast.Load())
+    params = [ast.keyword(arg=k, value=_astify_atom(v)) for k, v in eqn.params.items()]
     return ast.Assign(targets=outvars, value=ast.Call(
         func=ast.Attribute(
             value=ast.Name(id='jax.lax', ctx=ast.Load()),
             attr='dynamic_slice',
             ctx=ast.Load()
         ),
-        args=[_astify_var(sliced), invars],
+        args=[_astify_atom(sliced), invars],
         keywords=params
     ))
 
@@ -149,7 +146,7 @@ def _sourcify_dynamic_slice(eqn):
 def is_array(arr):
     return isinstance(arr, (np.ndarray, np.generic, jnp.ndarray))
 
-def _astify_var(var):
+def _astify_atom(var):
     if isinstance(var, Literal):
         if is_array(var.val):
             if var.val.ndim == 0:
@@ -179,23 +176,27 @@ def _astify_var(var):
 
 
 def _astify_outvars(outvars):
-    return [ast.Name(repr(v)) for v in outvars]
+    out = [ast.Name(repr(v)) for v in outvars]
+    if len(out) == 1:
+        return out
+    else:
+        return [ast.Tuple(elts=out, ctx=ast.Store())]
 
 
-def assign_expr(call_expr: Callable):
+
+
+def assign_stmt(call_expr: Callable):
     def binop_fn(eqn):
-        return ast.Assign(_astify_outvars(eqn.outvars), call_expr(*[_astify_var(v) for v in eqn.invars],
-                                                                  **{k: _astify_var(v) for k, v in eqn.params.items()}
+        return ast.Assign(_astify_outvars(eqn.outvars), call_expr(*[_astify_atom(v) for v in eqn.invars],
+                                                                  **{k: _astify_atom(v) for k, v in eqn.params.items()}
                                                                   ))
-
-
     return binop_fn
 
 def binop_fn(op: Union[ast.operator, ast.cmpop]):
-    return assign_expr(lambda x, y: ast.BinOp(left=x, op=op, right=y))
+    return assign_stmt(lambda x, y: ast.BinOp(left=x, op=op, right=y))
 
 def dumb_fn(fn_name):
-    return assign_expr(lambda *args, **kwargs: ast.Call(
+    return assign_stmt(lambda *args, **kwargs: ast.Call(
         func=ast.Name(id=fn_name, ctx=ast.Load()),
         args=list(args),
         keywords=[ast.keyword(arg=k, value=v) for k, v in kwargs.items()]
@@ -203,7 +204,7 @@ def dumb_fn(fn_name):
 
 def _reduce_fn(fn_name: str):
     def dumb_fn_fn(eqn):
-        invars = [_astify_var(v) for v in eqn.invars]
+        invars = [_astify_atom(v) for v in eqn.invars]
         outvars = _astify_outvars(eqn.outvars)
         if eqn.params:
             params = eqn.params.copy()
@@ -212,7 +213,7 @@ def _reduce_fn(fn_name: str):
             call_op = ast.Call(
                 func=ast.Name(id=fn_name, ctx=ast.Load()),
                 args=invars,
-                keywords=[ast.keyword(arg=k, value=_astify_var(v)) for k, v in params.items()]
+                keywords=[ast.keyword(arg=k, value=_astify_atom(v)) for k, v in params.items()]
             )
         else:
             call_op = ast.Call(
@@ -224,6 +225,40 @@ def _reduce_fn(fn_name: str):
         return ast.Assign(outvars, call_op)
 
     return dumb_fn_fn
+
+def _astify_scan(eqn):
+    global skolem_id
+    assert eqn.primitive.name == 'scan'
+
+    jaxpr = eqn.params['jaxpr']
+    jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
+
+    fn_name = f"scan_fn_{skolem_id}"
+    skolem_id += 1
+    fn_ast = jaxpr_to_py_ast(jaxpr, fn_name)
+
+    length = _astify_atom(eqn.params['length'])
+    unroll = _astify_atom(eqn.params['unroll'])
+    reverse = _astify_atom(eqn.params['reverse'])
+
+
+    assign = ast.Assign(
+        targets=_astify_outvars(eqn.outvars),
+        value=ast.Call(
+            func=ast.Name(id='jax.lax.scan', ctx=ast.Load()),
+            args=[ast.Name(id=fn_name, ctx=ast.Load())] + [_astify_atom(v) for v in eqn.invars],
+            keywords=[ast.keyword(arg='length', value=length), ast.keyword(arg='unroll', value=unroll), ast.keyword(arg='reverse', value=reverse)]
+        ))
+
+    return [fn_ast, assign]
+
+
+
+
+
+
+
+
 
 prim_to_python = {
     'add': binop_fn(ast.Add()),
@@ -248,6 +283,7 @@ prim_to_python = {
     'reshape': dumb_fn('jax.numpy.reshape'),
     'reduce_sum': _reduce_fn('jax.numpy.sum'),
     'transpose': dumb_fn('jax.lax.transpose'),
+    'scan': _astify_scan,
 }
 
 constant_fold_blacklist = {
@@ -256,24 +292,4 @@ constant_fold_blacklist = {
 }
 
 skolem_id = 0
-
-def _sourcify_scan(eqn):
-    global skolem_id
-    assert eqn.primitive.name == 'scan'
-
-    jaxpr = eqn.params['jaxpr']
-    jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
-
-    fn_name = f"scan_fn_{skolem_id}"
-    fn_source = jaxpr_to_source(jaxpr, fn_name)
-
-    reverse = eqn.params['reverse']
-    length = eqn.params['length']
-    unroll = eqn.params['unroll']
-
-    return f"""
-{fn_source}
-
-    """
-
 
