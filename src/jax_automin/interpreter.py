@@ -6,6 +6,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.core import Literal, Var, Jaxpr
 
+from jax_automin.utils import IdentitySet
+
 
 def automin_function(f, *args, **kwargs):
     closed_jaxpr = jax.make_jaxpr(f)(*args, **kwargs)
@@ -81,6 +83,8 @@ def partial_eval_jaxpr(jaxpr, env):
         elif all(val is not None for val in vals):
             # go ahead and eval it
             out = _eval_eqn(eqn, vals)
+
+            # two options: either it's a jaxpr result (partial eval) or it's a list of values
             if not isinstance(out, tuple) and not isinstance(out, list):
                 out = (out,)
 
@@ -96,13 +100,20 @@ def partial_eval_jaxpr(jaxpr, env):
         eqn = eqn.replace(invars=tuple(read_or_self(var) for var in eqn.invars))
         out_eqns.append(eqn)
 
+    invars_still_used = IdentitySet()
+    for eqn in out_eqns:
+        for var in eqn.invars:
+            invars_still_used.add(var)
+
+    invars = tuple(var for var in jaxpr.invars if var in invars_still_used)
+
     # sub in any constants for outvars
     outvars = tuple(read_or_self(var) for var in jaxpr.outvars)
 
-    return jaxpr.replace(eqns=out_eqns, outvars=outvars)
+    return jaxpr.replace(eqns=out_eqns, outvars=outvars, invars=invars)
 
 
-def _eval_eqn(eqn, vals):
+def _eval_eqn(eqn, vals) -> Union[Jaxpr, tuple, list, jnp.ndarray]:
     if eqn.primitive.name == "closed_call":
         assert eqn.primitive.call_primitive == True
         assert eqn.primitive.map_primitive == False
