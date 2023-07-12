@@ -4,8 +4,7 @@ from typing import Callable, Union
 import jax
 import jax.numpy as jnp
 import numpy as np
-from equinox import is_array
-from jax.core import Literal, Var
+from jax.core import Literal, Var, Jaxpr
 
 
 def automin_function(f, *args, **kwargs):
@@ -35,7 +34,7 @@ def jaxpr_to_py_ast(jaxpr, fn_name="function"):
         if prim in prim_to_python:
             eqn_stmts = prim_to_python[prim](eqn)
         else:
-            eqn_stmts = dumb_fn(prim)(eqn)
+            eqn_stmts = normal_fn(prim)(eqn)
 
         if isinstance(eqn_stmts, list):
             stmts.extend(eqn_stmts)
@@ -82,10 +81,11 @@ def partial_eval_jaxpr(jaxpr, env):
         elif all(val is not None for val in vals):
             # go ahead and eval it
             out = _eval_eqn(eqn, vals)
-            if not isinstance(out, tuple):
+            if not isinstance(out, tuple) and not isinstance(out, list):
                 out = (out,)
 
             for var, val in zip(eqn.outvars, out):
+                assert not isinstance(val, Jaxpr)
                 env[var] = val
         else:
             new_eqns.append(eqn)
@@ -108,6 +108,8 @@ def _eval_eqn(eqn, vals):
         assert eqn.primitive.map_primitive == False
 
         out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr, {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
+    elif eqn.primitive.name == "scan":
+        out = eqn.primitive.bind(*vals, **eqn.params)
     else:
         out = eqn.primitive.bind(*vals, **eqn.params)
     return out
@@ -141,8 +143,6 @@ def _sourcify_dynamic_slice(eqn):
         keywords=params
     ))
 
-
-
 def is_array(arr):
     return isinstance(arr, (np.ndarray, np.generic, jnp.ndarray))
 
@@ -155,18 +155,6 @@ def _astify_atom(var):
             else:
                 expr = ast.parse(f"jax.numpy.{repr(var.val)}") # TODO: super hacky
                 return expr
-                # return ast.Constant(value=var.val)
-                # need to synthesize a call to jax.numpy.array
-                # return ast.Call(
-                #     func=ast.Attribute(
-                #         value=ast.Name(id='jax.numpy', ctx=ast.Load()),
-                #         attr='array',
-                #         ctx=ast.Load()
-                #     ),
-                #     args=
-                #     keywords=[]
-                # )
-
         else:
             return ast.parse(repr(var.val))
     elif isinstance(var, Var):
@@ -183,8 +171,6 @@ def _astify_outvars(outvars):
         return [ast.Tuple(elts=out, ctx=ast.Store())]
 
 
-
-
 def assign_stmt(call_expr: Callable):
     def binop_fn(eqn):
         return ast.Assign(_astify_outvars(eqn.outvars), call_expr(*[_astify_atom(v) for v in eqn.invars],
@@ -195,7 +181,7 @@ def assign_stmt(call_expr: Callable):
 def binop_fn(op: Union[ast.operator, ast.cmpop]):
     return assign_stmt(lambda x, y: ast.BinOp(left=x, op=op, right=y))
 
-def dumb_fn(fn_name):
+def normal_fn(fn_name):
     return assign_stmt(lambda *args, **kwargs: ast.Call(
         func=ast.Name(id=fn_name, ctx=ast.Load()),
         args=list(args),
@@ -230,6 +216,10 @@ def _astify_scan(eqn):
     global skolem_id
     assert eqn.primitive.name == 'scan'
 
+    if eqn.params['num_carry'] == 0:
+        # this is a map
+        return _astify_map(eqn)
+
     jaxpr = eqn.params['jaxpr']
     jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
 
@@ -241,7 +231,6 @@ def _astify_scan(eqn):
     unroll = _astify_atom(eqn.params['unroll'])
     reverse = _astify_atom(eqn.params['reverse'])
 
-
     assign = ast.Assign(
         targets=_astify_outvars(eqn.outvars),
         value=ast.Call(
@@ -252,11 +241,53 @@ def _astify_scan(eqn):
 
     return [fn_ast, assign]
 
+def _astify_map(eqn):
+    global skolem_id
+    assert eqn.primitive.name == 'scan'
+    assert eqn.params['num_carry'] == 0
+
+    jaxpr = eqn.params['jaxpr']
+    jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
+
+    fn_name = f"map_fn_{skolem_id}"
+    skolem_id += 1
+    fn_ast = jaxpr_to_py_ast(jaxpr, fn_name)
+
+    # map is a bit funny, because the jaxpr takes K args, but the jax.lax.map function takes a single tuple arg
+    # so we need to use a lambda to redirect the call
+    lam = ast.parse(f"lambda args: {fn_name}(*args)").body[0]
+
+    assign = ast.Assign(
+        targets=_astify_outvars(eqn.outvars),
+        value=ast.Call(
+            func=ast.Name(id='jax.lax.map', ctx=ast.Load()),
+            args=[lam, ast.Tuple(elts=[_astify_atom(v) for v in eqn.invars], ctx=ast.Load())],
+            keywords=[]
+        ))
+
+    return [fn_ast, assign]
 
 
+def _astify_closed_call(eqn):
+    global skolem_id
+    # out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr,
+    #                          {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
+    call_japr = constant_fold_jaxpr(eqn.params['call_jaxpr'].jaxpr)
+    fn_name = f"call_fn_{skolem_id}"
+    skolem_id += 1
 
+    fn_ast = jaxpr_to_py_ast(call_japr, fn_name)
 
+    invars = [_astify_atom(v) for v in eqn.invars]
+    outvars = _astify_outvars(eqn.outvars)
 
+    assign = ast.Assign(
+        targets=outvars,
+        value=ast.Call(
+            func=ast.Name(id=fn_name, ctx=ast.Load()),
+            args=invars,
+            keywords=[]
+        ))
 
 
 
@@ -265,25 +296,26 @@ prim_to_python = {
     'sub': binop_fn(ast.Sub()),
     'mul': binop_fn(ast.Mult()),
     'div': binop_fn(ast.Div()),
-    'neg': dumb_fn('jax.lax.neg'),
+    'neg': normal_fn('jax.lax.neg'),
     'lt': binop_fn(ast.Lt()),
     'gt': binop_fn(ast.Gt()),
     'le': binop_fn(ast.LtE()),
     'ge': binop_fn(ast.GtE()),
     'eq': binop_fn(ast.Eq()),
     'ne': binop_fn(ast.NotEq()),
-    'min': dumb_fn('jax.lax.min'),
-    'max': dumb_fn('jax.lax.max'),
-    'select_n': dumb_fn('jax.lax.select_n'),
+    'min': normal_fn('jax.lax.min'),
+    'max': normal_fn('jax.lax.max'),
+    'select_n': normal_fn('jax.lax.select_n'),
     'dynamic_slice': _sourcify_dynamic_slice,
-    'squeeze': dumb_fn('jax.lax.squeeze'),
+    'squeeze': normal_fn('jax.lax.squeeze'),
     'dot_general': _astify_dot_general,
-    'broadcast_in_dim': dumb_fn('jax.lax.broadcast_in_dim'),
-    'broadcast': dumb_fn('jax.lax.broadcast'),
-    'reshape': dumb_fn('jax.numpy.reshape'),
+    'broadcast_in_dim': normal_fn('jax.lax.broadcast_in_dim'),
+    'broadcast': normal_fn('jax.lax.broadcast'),
+    'reshape': normal_fn('jax.numpy.reshape'),
     'reduce_sum': _reduce_fn('jax.numpy.sum'),
-    'transpose': dumb_fn('jax.lax.transpose'),
+    'transpose': normal_fn('jax.lax.transpose'),
     'scan': _astify_scan,
+    'closed_call': _astify_closed_call,
 }
 
 constant_fold_blacklist = {

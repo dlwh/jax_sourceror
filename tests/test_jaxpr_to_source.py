@@ -39,6 +39,7 @@ def check_roundtrip(f, *args, **kwargs):
 
     f_results = f(*args, **kwargs)
     f2_results = f2(*args, **kwargs)
+
     if isinstance(f_results, tuple):
         assert isinstance(f2_results, tuple)
         assert len(f_results) == len(f2_results)
@@ -88,8 +89,6 @@ def test_pseudo_sliding_window_attn_block():
 
     f2 = check_roundtrip(block, x)
 
-
-
 def test_scan():
     def scanfn(x, y):
         return x + y, x * y
@@ -106,7 +105,33 @@ def test_scan():
     assert jnp.alltrue(f(x, y)[1] == f2(x, y)[1])
 
 
+def test_map():
+    def f(x):
+        return x + 1
 
+    x = jnp.arange(10)
+
+    def g(x):
+        return jax.lax.map(f, x)
+
+    g2 = check_roundtrip(g, x)
+
+    assert jnp.alltrue(g(x) == g2(x))
+
+
+def test_map_pytree():
+    def f(x):
+        return x[0] + 1, x[1] + 1
+
+    x = jnp.arange(10)
+
+    def g(x, y):
+        return jax.lax.map(f, (x, y))
+
+    g2 = check_roundtrip(g, x, x)
+
+    assert jnp.alltrue(g(x, x)[0] == g2(x, x)[0])
+    assert jnp.alltrue(g(x, x)[1] == g2(x, x)[1])
 
 
 def test_pseudo_sliding_window_attention():
