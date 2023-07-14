@@ -35,7 +35,7 @@ def test_jaxpr_to_source_matmul():
 
 def check_roundtrip(f, *args, **kwargs):
     source = automin_function(f, *args, **kwargs)
-    f2 = _exec_sandboxed(source, f.__name__)
+    f2 = _parse_sandboxed(source, f.__name__)
 
     f_results = f(*args, **kwargs)
     f2_results = f2(*args, **kwargs)
@@ -50,7 +50,7 @@ def check_roundtrip(f, *args, **kwargs):
     return f2
 
 
-def _exec_sandboxed(source, fn_name):
+def _parse_sandboxed(source, fn_name):
     g = {'jax': jax}
     l = {}
     exec(source, g, l)
