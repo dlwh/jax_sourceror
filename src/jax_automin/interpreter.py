@@ -271,8 +271,16 @@ def _astify_array(value):
     if isinstance(value, np.int64):
         return ast.Constant(value=int(value))
 
-    if value.ndim == 0 and value.dtype in (jnp.float32, jnp.int32, jnp.bool_):
+    if value.ndim == 0 and value.dtype in (jnp.float32, jnp.int32, jnp.bool_, jnp.int64):
         return ast.Constant(value=value.item())
+
+    if value.ndim == 0:
+        dtype_value = _astify_value(value.dtype)
+        return ast.Call(
+            dtype_value,
+            args=[ast.Constant(value=value.item())],
+            keywords=[],
+        )
 
     values = value.tolist()
 
@@ -302,6 +310,7 @@ def _astify_atom(state: _SourcererState, var: Union[Literal, Var]):
 
 def _astify_value(value):
     assert not isinstance(value, (Literal, Var))
+
     if is_array(value):
         return _astify_array(value)
     elif isinstance(value, (int, bool, float, str, type(None))):
@@ -309,7 +318,14 @@ def _astify_value(value):
     elif isinstance(value, (tuple, list)):
         return ast.Tuple(elts=[_astify_value(v) for v in value], ctx=ast.Load())
     elif isinstance(value, jnp.dtype):
-        return ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='dtype', ctx=ast.Load()), args=[ast.Constant(value=str(value))], keywords=[])
+        # return ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='dtype', ctx=ast.Load()), args=[ast.Constant(value=str(value))], keywords=[])
+        if value.name in ('float32', 'float64', 'int32', 'int64', 'bfloat16', 'float16'):
+            # return ast.Constant(value=getattr(jnp, value.name))
+            return ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr=value.name, ctx=ast.Load())
+        elif value.name == 'bool':
+            return ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='bool_', ctx=ast.Load())
+        else:
+            return ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='dtype', ctx=ast.Load()), args=[ast.Constant(value=str(value))], keywords=[])
     else:
         warnings.warn(f"Unknown value type {type(value)}")
         return ast.parse(repr(value)).body[0]
