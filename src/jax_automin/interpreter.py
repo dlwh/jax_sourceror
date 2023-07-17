@@ -567,12 +567,14 @@ def _astify_map(state, eqn):
 def _astify_closed_call(state, eqn):
     # out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr,
     #                          {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
-    call_japr = constant_fold_jaxpr(eqn.params['call_jaxpr'].jaxpr)
+    raw_jaxpr = eqn.params['call_jaxpr'].jaxpr
+    literal_args = {k: v.val for k, v in zip(raw_jaxpr.invars, eqn.invars) if isinstance(v, Literal)}
+    call_japr = partial_eval_jaxpr(raw_jaxpr, literal_args)
     fn_name = state.skolem('fn')
 
     fn_ast = jaxpr_to_py_ast(state, call_japr, fn_name)
 
-    invars = [_astify_atom(state, v) for v in eqn.invars]
+    invars = [_astify_atom(state, v) for v in eqn.invars if not isinstance(v, Literal)]
     outvars = _astify_outvars(state, eqn.outvars)
 
     assign = ast.Assign(
