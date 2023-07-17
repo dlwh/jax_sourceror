@@ -172,7 +172,6 @@ def test_pseudo_sliding_window_attention():
             z = jnp.einsum('bthd,hde->bte', y, o)
             return z, None
 
-
         x, _ = jax.lax.scan(layer, x, params)
 
         return x
@@ -184,7 +183,8 @@ def test_pseudo_sliding_window_attention():
 
     def grad_fn(params, x):
         loss, grad = jax.value_and_grad(loss_fn)(params, x)
-        return loss, grad
+        # we can't reasonably sourcerize pytrees so just get the leaves
+        return loss, *jax.tree_util.tree_leaves(grad)
 
     qkv = jnp.ones((num_layers, num_heads, head_size, embed_size), dtype=jnp.bfloat16)
     o = jnp.ones((num_layers, num_heads, head_size, embed_size), dtype=jnp.bfloat16)

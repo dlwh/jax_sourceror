@@ -214,9 +214,8 @@ def _astify_dot_general(state, eqn):
 
 def _sourcify_dynamic_slice(state, eqn):
     sliced = eqn.invars[0]
-    # now we use ast
-    outvars = _astify_outvars(state, eqn.outvars)
     invars = ast.Tuple(elts=[_astify_atom(state, var) for var in eqn.invars[1:]], ctx=ast.Load())
+    outvars = _astify_outvars(state, eqn.outvars)
     params = [ast.keyword(arg=k, value=_astify_value(v)) for k, v in eqn.params.items()]
     return ast.Assign(targets=outvars, value=ast.Call(
         func=ast.Attribute(
@@ -226,6 +225,25 @@ def _sourcify_dynamic_slice(state, eqn):
         ),
         args=[_astify_atom(state, sliced), invars],
         keywords=params
+    ))
+
+def _sourcify_dynamic_update_slice(state, eqn):
+    sliced = eqn.invars[0]
+    # the first two arguments are the sliced array and the update array
+    # the remaining are start indices and should be packaged into a tuple
+    target = _astify_atom(state, eqn.invars[0])
+    update = _astify_atom(state, eqn.invars[1])
+    start_indices = maybe_tuple_vars([_astify_atom(state, var) for var in eqn.invars[2:]])
+    outvars = _astify_outvars(state, eqn.outvars)
+
+    return ast.Assign(targets=outvars, value=ast.Call(
+        func=ast.Attribute(
+            value=ast.Name(id='jax.lax', ctx=ast.Load()),
+            attr='dynamic_update_slice',
+            ctx=ast.Load()
+        ),
+        args=[target, update, start_indices],
+        keywords=[]
     ))
 
 
@@ -250,7 +268,10 @@ def is_array(arr):
 
 def _astify_array(value):
     assert is_array(value)
-    if value.ndim == 0:
+    if isinstance(value, np.int64):
+        return ast.Constant(value=int(value))
+
+    if value.ndim == 0 and value.dtype in (jnp.float32, jnp.int32, jnp.bool_):
         return ast.Constant(value=value.item())
 
     values = value.tolist()
@@ -261,7 +282,6 @@ def _astify_array(value):
         else:
             return ast.Constant(value=values)
 
-
     return ast.Call(
         func=ast.Attribute(
             value=ast.Name(id='jax.numpy', ctx=ast.Load()),
@@ -269,7 +289,7 @@ def _astify_array(value):
             ctx=ast.Load()
         ),
         args=[rec_astify_list(values)],
-        keywords=[]
+        keywords=[ast.keyword(arg='dtype', value=_astify_value(value.dtype))]
     )
 
 def _astify_atom(state: _SourcererState, var: Union[Literal, Var]):
@@ -307,6 +327,13 @@ def maybe_tuple_vars(vars):
         return vars[0]
     else:
         return ast.Tuple(elts=vars, ctx=ast.Load())
+
+
+def maybe_untuple_vars(var, is_tuple):
+    if is_tuple:
+        return ast.Starred(value=var, ctx=ast.Load())
+    else:
+        return var
 
 
 
@@ -402,7 +429,9 @@ def _astify_scan(state, eqn):
 
         initial_assign = ast.Assign(
             targets=[ast.Tuple(elts=[ast.Name(a.arg) for a in fn_ast.args.args], ctx=ast.Store())],
-            value=ast.Tuple(elts=[*constant_args, ast.Starred(value=ast.Name(id='carry', ctx=ast.Load()), ctx=ast.Load()), ast.Starred(value=ast.Name(id='x', ctx=ast.Load()), ctx=ast.Load())], ctx=ast.Load())
+            value=ast.Tuple(elts=[*constant_args,
+                                  maybe_untuple_vars(ast.Name(id='carry', ctx=ast.Load()), num_carry != 1),
+                                    maybe_untuple_vars(ast.Name(id='x', ctx=ast.Load()), len(xs) != 1)])
         )
 
         fn_return = fn_ast.body[-1]
@@ -581,6 +610,18 @@ def _astify_reshape(state, eqn):
     return [assign]
 
 
+def _astify_add_any(state, eqn):
+    # add_Any is a weird undocumented jax primitive. best guess is it adds?
+    return binop_fn(ast.Add())(state, eqn)
+
+
+def _astify_broadcast_in_dim(state, eqn):
+    # broadcast_in_dim is mostly reasonable, except that the dtype is often implicit in the return type
+
+    raise NotImplementedError()
+
+
+
 prim_to_python = {
     'add': binop_fn(ast.Add()),
     'sub': binop_fn(ast.Sub()),
@@ -598,9 +639,11 @@ prim_to_python = {
     'convert_element_type': _astify_convert_element_type,
     'select_n': normal_fn('jax.lax.select_n'),
     'dynamic_slice': _sourcify_dynamic_slice,
+    'dynamic_update_slice': _sourcify_dynamic_update_slice,
     'squeeze': normal_fn('jax.lax.squeeze'),
     'dot_general': _astify_dot_general,
     'broadcast_in_dim': normal_fn('jax.lax.broadcast_in_dim'),
+    # 'broadcast_in_dim': _astify_broadcast_in_dim,
     'broadcast': normal_fn('jax.lax.broadcast'),
     'reduce_sum': _reduce_fn('jax.numpy.sum'),
     'transpose': normal_fn('jax.lax.transpose'),
@@ -608,6 +651,7 @@ prim_to_python = {
     'closed_call': _astify_closed_call,
     'remat2': _astify_remat,
     'reshape': _astify_reshape,
+    'add_any': _astify_add_any,
 }
 
 constant_fold_blacklist = {
