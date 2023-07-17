@@ -13,6 +13,7 @@ from jax_automin.utils import IdentityMap, IdentitySet
 
 @dataclass
 class _SourcererState():
+    """State for the sourcerer. Basically just in charge of naming variables."""
     _var_names: IdentityMap[Var, str] = dataclasses.field(default_factory=IdentityMap)
     _skolem_count: int = 0
 
@@ -47,7 +48,11 @@ def automin_function(f, *args, **kwargs):
     closed_jaxpr = jax.make_jaxpr(f)(*args, **kwargs)
     jaxpr = constant_fold_jaxpr(closed_jaxpr.jaxpr)
     state = _SourcererState()
-    node = jaxpr_to_py_ast(state, jaxpr, fn_name=f.__name__)
+    try:
+        name = f.__name__
+    except AttributeError:
+        name = "unknown"
+    node = jaxpr_to_py_ast(state, jaxpr, fn_name=name)
     node = _maybe_wrap_fn_for_leaves(node, f, len(args) + len(kwargs))
     ast.fix_missing_locations(node)
     source = ast.unparse(node)
