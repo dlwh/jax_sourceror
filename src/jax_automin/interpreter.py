@@ -133,9 +133,10 @@ def partial_eval_jaxpr(jaxpr, env):
             return var
         elif isinstance(out, Var):
             return out
+        elif isinstance(out, Literal):
+            return Literal(out.val, var.aval)
         else:
             assert not isinstance(out, Jaxpr)
-            assert not isinstance(out, Literal)
             return Literal(out, var.aval)
 
     for eqn in jaxpr.eqns:
@@ -422,10 +423,18 @@ def _astify_scan(state, eqn):
         # this is a map
         # return _astify_map(eqn)
 
-    jaxpr = eqn.params['jaxpr']
-    jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
+    constant_args = eqn.invars[:num_consts]
+    carries = eqn.invars[num_consts:num_consts + num_carry]
+    xs = eqn.invars[num_consts + num_carry:]
 
-    stmts = []
+    jaxpr = eqn.params['jaxpr']
+
+    if num_consts != 0:
+        # we want to construct an environment where we partial eval the function using the constants as the env
+        env = dict(zip(jaxpr.jaxpr.invars, constant_args))
+        jaxpr = partial_eval_jaxpr(jaxpr.jaxpr, env)
+    else:
+        jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
 
     fn_name = state.skolem('fn')
     fn_ast = jaxpr_to_py_ast(state, jaxpr, fn_name)
@@ -434,15 +443,13 @@ def _astify_scan(state, eqn):
     unroll = _astify_value(eqn.params['unroll'])
     reverse = _astify_value(eqn.params['reverse'])
 
-    if num_consts > 0 or num_carry != 1 or len(jaxpr.invars) != 2:
-        # what we want is something like:
-        # fn_name = lambda carry, xs: fn_name(constants..., *carry, *xs)
-        # jax.lax.scan(fn_name, (carries...), (xs...))
-        constant_args = eqn.invars[:num_consts]
-        carries = eqn.invars[num_consts:num_consts + num_carry]
-        xs = eqn.invars[num_consts + num_carry:]
+    stmts = []
 
-        constant_args = [_astify_atom(state, v) for v in constant_args]
+    if num_carry != 1 or len(jaxpr.invars) != 2:
+        # what we want is something like:
+        # fn_name = lambda carry, xs: fn_name(*carry, *xs)
+        # jax.lax.scan(fn_name, (carries...), (xs...))
+
         modified_signature = ast.arguments(
             args=[ast.arg(arg='carry'), ast.arg(arg='x')],
             vararg=None,
@@ -455,8 +462,7 @@ def _astify_scan(state, eqn):
 
         initial_assign = ast.Assign(
             targets=[ast.Tuple(elts=[ast.Name(a.arg) for a in fn_ast.args.args], ctx=ast.Store())],
-            value=ast.Tuple(elts=[*constant_args,
-                                  maybe_untuple_vars(ast.Name(id='carry', ctx=ast.Load()), num_carry != 1),
+            value=ast.Tuple(elts=[maybe_untuple_vars(ast.Name(id='carry', ctx=ast.Load()), num_carry != 1),
                                     maybe_untuple_vars(ast.Name(id='x', ctx=ast.Load()), len(xs) != 1)])
         )
 
