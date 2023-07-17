@@ -615,13 +615,6 @@ def _astify_add_any(state, eqn):
     return binop_fn(ast.Add())(state, eqn)
 
 
-def _astify_broadcast_in_dim(state, eqn):
-    # broadcast_in_dim is mostly reasonable, except that the dtype is often implicit in the return type
-
-    raise NotImplementedError()
-
-
-
 prim_to_python = {
     'add': binop_fn(ast.Add()),
     'sub': binop_fn(ast.Sub()),
@@ -643,7 +636,6 @@ prim_to_python = {
     'squeeze': normal_fn('jax.lax.squeeze'),
     'dot_general': _astify_dot_general,
     'broadcast_in_dim': normal_fn('jax.lax.broadcast_in_dim'),
-    # 'broadcast_in_dim': _astify_broadcast_in_dim,
     'broadcast': normal_fn('jax.lax.broadcast'),
     'reduce_sum': _reduce_fn('jax.numpy.sum'),
     'transpose': normal_fn('jax.lax.transpose'),
