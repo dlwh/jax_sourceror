@@ -250,16 +250,26 @@ def _sourcify_dynamic_update_slice(state, eqn):
 def _astify_convert_element_type(state, eqn):
     # now we use ast
     outvars = _astify_outvars(state, eqn.outvars)
-    invars = [_astify_atom(state, var) for var in eqn.invars]
-    params = [ast.keyword(arg=k, value=_astify_value(v)) for k, v in eqn.params.items() if k != 'weak_type']
+    assert len(eqn.invars) == 1
+    invar = _astify_atom(state, eqn.invars[0])
+    dtype = _astify_value(eqn.params['new_dtype'])
+    # return ast.Assign(targets=outvars, value=ast.Call(
+    #     func=ast.Attribute(
+    #         value=ast.Name(id='jax.lax', ctx=ast.Load()),
+    #         attr='convert_element_type',
+    #         ctx=ast.Load()
+    #     ),
+    #     args=[invars],
+    #     keywords=params
+    # ))
     return ast.Assign(targets=outvars, value=ast.Call(
         func=ast.Attribute(
-            value=ast.Name(id='jax.lax', ctx=ast.Load()),
-            attr='convert_element_type',
+            value=invar,
+            attr='astype',
             ctx=ast.Load()
         ),
-        args=[invars],
-        keywords=params
+        args=[dtype],
+        keywords=[]
     ))
 
 def is_array(arr):
@@ -627,8 +637,60 @@ def _astify_reshape(state, eqn):
 
 
 def _astify_add_any(state, eqn):
-    # add_Any is a weird undocumented jax primitive. best guess is it adds?
+    # add_any is a weird undocumented jax primitive. best guess is it adds?
     return binop_fn(ast.Add())(state, eqn)
+
+
+def _astify_broadcast_in_dim(state, eqn):
+    # broadcast_in_dim is how zeros, ones, full, etc are implemented,
+    # so we prefer to use those where possible
+    assert len(eqn.invars) == 1
+    value = eqn.invars[0]
+    shape = eqn.params['shape']
+    broadcast_dimensions = eqn.params['broadcast_dimensions']
+
+    if not isinstance(value, Literal) or broadcast_dimensions != ():
+        return normal_fn('jax.lax.broadcast_in_dim')(state, eqn)
+
+    if not isinstance(value.val, np.ndarray) or value.val.ndim != 0:
+        return normal_fn('jax.lax.broadcast_in_dim')(state, eqn)
+    else:
+        constant_value = value.val.item()
+        if constant_value == 0:
+            call = ast.Call(
+                ast.Attribute(
+                    value=ast.Name(id='jax.numpy', ctx=ast.Load()),
+                    attr='zeros',
+                    ctx=ast.Load()
+                ),
+                args=[_astify_value(shape), _astify_value(value.val.dtype)],
+                keywords=[]
+            )
+        elif constant_value == 1:
+            call = ast.Call(
+                ast.Attribute(
+                    value=ast.Name(id='jax.numpy', ctx=ast.Load()),
+                    attr='ones',
+                    ctx=ast.Load()
+                ),
+                args=[_astify_value(shape), _astify_value(value.val.dtype)],
+                keywords=[]
+            )
+        else:
+            call = ast.Call(
+                ast.Attribute(
+                    value=ast.Name(id='jax.numpy', ctx=ast.Load()),
+                    attr='full',
+                    ctx=ast.Load()
+                ),
+                args=[_astify_value(shape), _astify_value(constant_value), _astify_value(value.val.dtype)],
+                keywords=[]
+            )
+
+        return [ast.Assign(
+            targets=_astify_outvars(state, eqn.outvars),
+            value=call
+        )]
 
 
 prim_to_python = {
@@ -651,7 +713,8 @@ prim_to_python = {
     'dynamic_update_slice': _sourcify_dynamic_update_slice,
     'squeeze': normal_fn('jax.lax.squeeze'),
     'dot_general': _astify_dot_general,
-    'broadcast_in_dim': normal_fn('jax.lax.broadcast_in_dim'),
+    # 'broadcast_in_dim': normal_fn('jax.lax.broadcast_in_dim'),
+    'broadcast_in_dim': _astify_broadcast_in_dim,
     'broadcast': normal_fn('jax.lax.broadcast'),
     'reduce_sum': _reduce_fn('jax.numpy.sum'),
     'transpose': normal_fn('jax.lax.transpose'),
