@@ -44,9 +44,9 @@ def check_roundtrip(f, *args, **kwargs):
         assert isinstance(f2_results, tuple)
         assert len(f_results) == len(f2_results)
         for a, b in zip(f_results, f2_results):
-            assert jnp.alltrue(a == b)
+            assert jnp.all(a == b)
     else:
-        assert jnp.alltrue(f_results == f2_results)
+        assert jnp.all(f_results == f2_results)
     return f2
 
 
@@ -101,8 +101,8 @@ def test_scan():
 
     f2 = check_roundtrip(f, x, y)
 
-    assert jnp.alltrue(f(x, y)[0] == f2(x, y)[0])
-    assert jnp.alltrue(f(x, y)[1] == f2(x, y)[1])
+    assert jnp.all(f(x, y)[0] == f2(x, y)[0])
+    assert jnp.all(f(x, y)[1] == f2(x, y)[1])
 
 
 def test_map():
@@ -116,7 +116,7 @@ def test_map():
 
     g2 = check_roundtrip(g, x)
 
-    assert jnp.alltrue(g(x) == g2(x))
+    assert jnp.all(g(x) == g2(x))
 
 
 def test_map_pytree():
@@ -130,8 +130,8 @@ def test_map_pytree():
 
     g2 = check_roundtrip(g, x, x)
 
-    assert jnp.alltrue(g(x, x)[0] == g2(x, x)[0])
-    assert jnp.alltrue(g(x, x)[1] == g2(x, x)[1])
+    assert jnp.all(g(x, x)[0] == g2(x, x)[0])
+    assert jnp.all(g(x, x)[1] == g2(x, x)[1])
 
 
 def test_pseudo_sliding_window_attention():
