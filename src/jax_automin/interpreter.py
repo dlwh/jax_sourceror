@@ -1,5 +1,6 @@
 import ast
 import dataclasses
+import enum
 import warnings
 from dataclasses import dataclass
 from typing import Callable, Union
@@ -7,6 +8,7 @@ from typing import Callable, Union
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental.pjit import _UNSPECIFIED
 from jax.core import Literal, Var, Jaxpr
 
 from jax_automin.utils import IdentityMap, IdentitySet
@@ -342,6 +344,11 @@ def _astify_value(value):
             return ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='bool_', ctx=ast.Load())
         else:
             return ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='dtype', ctx=ast.Load()), args=[ast.Constant(value=str(value))], keywords=[])
+    elif value is _UNSPECIFIED:
+        return ast.Attribute(value=ast.Name(id='jax.experimental.pjit', ctx=ast.Load()), attr='_UNSPECIFIED', ctx=ast.Load())
+    elif isinstance(value, enum.Enum):
+        return ast.Attribute(value=ast.Name(id=value.__class__.__qualname__, ctx=ast.Load()), attr=value.name, ctx=ast.Load())
+
     else:
         warnings.warn(f"Unknown value type {type(value)}")
         return ast.parse(repr(value)).body[0]
@@ -592,6 +599,64 @@ def _astify_closed_call(state, eqn):
 
     return [fn_ast, assign]
 
+def _astify_pjit(state, eqn):
+    # this one's a real pain.
+    # pjit's params are :
+        # jaxpr
+        # donated_invars:
+        # in_shardings, out_shardings
+        # resource env
+        # name (yay)
+        # keep_unused, inline (which we won't use)
+
+    jaxpr = eqn.params['jaxpr']
+    donated_invars = eqn.params['donated_invars']
+    in_shardings = eqn.params['in_shardings']
+    out_shardings = eqn.params['out_shardings']
+    resource_env = eqn.params['resource_env']
+    name = eqn.params['name']
+
+    can_ignore_donated = not any(donated_invars)
+
+    # preprocess the function
+    jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
+    fn_name = state.skolem(name)
+    fn_ast = jaxpr_to_py_ast(state, jaxpr, fn_name)
+
+    in_shardings = _astify_value(in_shardings)
+    out_shardings = _astify_value(out_shardings)
+
+    keywords = [
+        ast.keyword(arg='in_shardings', value=in_shardings),
+        ast.keyword(arg='out_shardings', value=out_shardings),
+    ]
+
+    if not can_ignore_donated:
+        donated_invars = _astify_value(donated_invars)
+        keywords.append(ast.keyword(arg='donated_invars', value=donated_invars))
+
+    jitted_fn = ast.Call(
+        func=
+        ast.Attribute(
+            ast.Name(id='jax.experimental.pjit', ctx=ast.Load()),
+            attr='pjit'),
+        args=[fn_ast],
+        keywords=keywords
+    )
+
+    assign = ast.Assign(
+        targets=_astify_outvars(state, eqn.outvars),
+        value=ast.Call(
+            func=jitted_fn,
+            args=[_astify_atom(state, v) for v in eqn.invars],
+            keywords=[]
+        ))
+
+    return [fn_ast, assign]
+
+
+
+
 
 def _astify_remat(state: _SourcererState, eqn):
     # out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr,
@@ -705,6 +770,14 @@ def _astify_broadcast_in_dim(state, eqn):
             value=call
         )]
 
+def _astify_random_wrap(state, eqn):
+    # we treat this as a noop
+    return ast.Assign(
+        targets=_astify_outvars(state, eqn.outvars),
+        value=_astify_atom(state, eqn.invars[0])
+    )
+
+
 
 prim_to_python = {
     'add': binop_fn(ast.Add()),
@@ -733,9 +806,11 @@ prim_to_python = {
     'transpose': normal_fn('jax.lax.transpose'),
     'scan': _astify_scan,
     'closed_call': _astify_closed_call,
+    'pjit': _astify_pjit,
     'remat2': _astify_remat,
     'reshape': _astify_reshape,
     'add_any': _astify_add_any,
+    'random_wrap': _astify_random_wrap,
 }
 
 constant_fold_blacklist = {
