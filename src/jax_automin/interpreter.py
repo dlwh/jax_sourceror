@@ -235,6 +235,25 @@ def _sourcify_dynamic_slice(state, eqn):
         keywords=params
     ))
 
+
+def _sourcify_slice(state, eqn):
+    sliced = eqn.invars[0]
+    # invars = ast.Tuple(elts=[_astify_atom(state, var) for var in eqn.invars[1:]], ctx=ast.Load())
+    outvars = _astify_outvars(state, eqn.outvars)
+    start_indices = eqn.params['start_indices']
+    limit_indices = eqn.params['limit_indices']
+    strides = eqn.params['strides']
+    if strides is None:
+        strides = (None,) * len(start_indices)
+    indices = [_astify_value(slice(s, e, stride)) for s, e, stride in zip(start_indices, limit_indices, strides)]
+    # params = [ast.keyword(arg=k, value=_astify_value(v)) for k, v in eqn.params.items()]
+    return ast.Assign(targets=outvars, value=ast.Subscript(
+        value=_astify_atom(state, sliced),
+        slice=ast.Tuple(elts=indices, ctx=ast.Load()),
+        ctx=ast.Load()
+    ))
+
+
 def _sourcify_dynamic_update_slice(state, eqn):
     sliced = eqn.invars[0]
     # the first two arguments are the sliced array and the update array
@@ -797,6 +816,7 @@ prim_to_python = {
     'select_n': normal_fn('jax.lax.select_n'),
     'dynamic_slice': _sourcify_dynamic_slice,
     'dynamic_update_slice': _sourcify_dynamic_update_slice,
+    'slice': _sourcify_slice,
     'squeeze': normal_fn('jax.lax.squeeze'),
     'dot_general': _astify_dot_general,
     # 'broadcast_in_dim': normal_fn('jax.lax.broadcast_in_dim'),
