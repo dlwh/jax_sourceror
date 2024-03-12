@@ -81,7 +81,8 @@ def test_pseudo_sliding_window_attn_block():
                                            (0, 1, 2))  # [batch, len, num_heads, len]
         # weights = with_sharding_constraint(weights, P('data', None, None, None))
         # without "bias", no boom
-        bias = jnp.ones(block_len).broadcast_in_dim((batch, block_len, num_heads, block_len), (1,))
+        bias = jnp.ones(block_len)
+        bias = jnp.broadcast_to(bias, (batch, block_len, num_heads, block_len))
         weights = weights + bias
         return jnp.einsum('bqhk,bkhd->bqhd', weights, query_block).astype(query_block.dtype)
 
@@ -153,7 +154,8 @@ def test_pseudo_sliding_window_attention():
                                                (0, 1, 2))  # [batch, len, num_heads, len]
             # weights = with_sharding_constraint(weights, P('data', None, None, None))
             # without "bias", no boom
-            bias = jnp.ones(block_len).broadcast_in_dim((batch, block_len, num_heads, block_len), (1,))
+            bias = jnp.ones(block_len)
+            bias = jnp.broadcast_to(bias, (batch, block_len, num_heads, block_len))
             weights = weights + bias
             return jnp.einsum('bqhk,bkhd->bqhd', weights, query_block).astype(query_block.dtype)
 

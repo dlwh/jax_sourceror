@@ -209,11 +209,19 @@ def _astify_dot_general(state, eqn):
     precision = eqn.params['precision']
     preferred_element_type = eqn.params['preferred_element_type']
 
+    has_dtype = preferred_element_type is None or x.aval.dtype == y.aval.dtype == preferred_element_type
+
     # recognize simple matmul case
-    if d == (((1,), (0,)), ((), ())) and precision == None and preferred_element_type == None:
+    if d == (((1,), (0,)), ((), ())) and precision == None:
         invars = [_astify_atom(state, x), _astify_atom(state, y)]
         outvars = _astify_outvars(state, eqn.outvars)
-        return ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='matmul', ctx=ast.Load()), args=invars, keywords=[]))
+        out = ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='matmul', ctx=ast.Load()), args=invars, keywords=[]))
+        if not has_dtype:
+            out = ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=out.value, attr='astype', ctx=ast.Load()), args=[_astify_value(preferred_element_type)], keywords=[]))
+
+        return out
+
+    # TODO: convert to einsum?
 
     invars = [_astify_atom(state, x), _astify_atom(state, y), _astify_value(d), _astify_value(precision),
              _astify_value(preferred_element_type)]
