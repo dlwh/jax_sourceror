@@ -79,7 +79,7 @@ def test_pseudo_sliding_window_attn_block():
         weights = jnp.sum(query_block, axis=3)  # [batch, len, num_heads]
         weights = jax.lax.broadcast_in_dim(weights, (batch, block_len, num_heads, block_len),
                                            (0, 1, 2))  # [batch, len, num_heads, len]
-        # weights = with_sharding_constraint(weights, P('data', None, None, None))
+        # weights = jax.lax.with_sharding_constraint(weights, PartitionSpec('data', None, None, None))
         # without "bias", no boom
         bias = jnp.ones(block_len)
         bias = jnp.broadcast_to(bias, (batch, block_len, num_heads, block_len))
@@ -88,7 +88,9 @@ def test_pseudo_sliding_window_attn_block():
 
     x = jnp.arange(batch * block_len * num_heads * head_size).reshape(batch, block_len, num_heads, head_size).astype(jnp.float32)
 
-    f2 = check_roundtrip(block, x)
+    mesh = jax.sharding.Mesh(jax.devices('cpu'), ('data',))
+    with mesh:
+        f2 = check_roundtrip(block, x)
 
 def test_scan():
     def scanfn(x, y):
