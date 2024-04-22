@@ -11,11 +11,11 @@ import numpy as np
 from jax.experimental.pjit import _UNSPECIFIED
 from jax.core import Literal, Var, Jaxpr
 
-from jax_automin.utils import IdentityMap, IdentitySet
+from jax_sourceror.utils import IdentityMap, IdentitySet
 
 @dataclass
-class _SourcererState():
-    """State for the sourcerer. Basically just in charge of naming variables."""
+class SourcerorState():
+    """State for the auto-minimizer. Basically just in charge of naming variables."""
     _var_names: IdentityMap[Var, str] = dataclasses.field(default_factory=IdentityMap)
     _skolem_count: int = 0
 
@@ -46,10 +46,10 @@ class _SourcererState():
         return f"{prefix}_{self._skolem_count}"
 
 
-def automin_function(f, *args, **kwargs):
+def sourcerize(f, *args, **kwargs):
     closed_jaxpr = jax.make_jaxpr(f)(*args, **kwargs)
     jaxpr = constant_fold_jaxpr(closed_jaxpr.jaxpr)
-    state = _SourcererState()
+    state = SourcerorState()
     try:
         name = f.__name__
     except AttributeError:
@@ -59,6 +59,112 @@ def automin_function(f, *args, **kwargs):
     ast.fix_missing_locations(node)
     source = ast.unparse(node)
     return source
+
+def register_prim_handler(prim_name, handler):
+    """
+    Register a handler for a primitive for automin
+    :param prim_name:
+    :param handler:
+    :return:
+    """
+    if prim_name in prim_to_python:
+        warnings.warn(f"Overwriting handler for primitive {prim_name}")
+    prim_to_python[prim_name] = handler
+
+
+def primitive_handler(prim_name):
+    """
+    Decorator to register a handler for a primitive.
+    :param prim_name:
+    :return:
+    """
+    def decorator(fn):
+        register_prim_handler(prim_name, fn)
+        return fn
+    return decorator
+
+
+def _assign_stmt(call_expr: Callable):
+    """
+    Create a handler for a primitive that is a simple assignment.
+    :param call_expr:
+    :return:
+    """
+    def binop_fn(state, eqn):
+        invars = [_astify_atom(state, v) for v in eqn.invars]
+        outvars = _astify_outvars(state, eqn.outvars)
+        return ast.Assign(outvars, call_expr(*invars,
+                                             **{k: _astify_value(v) for k, v in eqn.params.items()}
+                                             ))
+    return binop_fn
+
+def _binop_fn(op: ast.operator):
+    return _assign_stmt(lambda x, y: ast.BinOp(left=x, op=op, right=y))
+
+def _cmpop_fn(op: ast.cmpop):
+    return _assign_stmt(lambda x, y: ast.Compare(left=x, ops=[op], comparators=[y]))
+
+
+def normal_fn(fn_name):
+    """
+    Create a handler for a normal function call.
+    :param fn_name:
+    :return:
+    """
+    return _assign_stmt(lambda *args, **kwargs: ast.Call(
+        func=ast.Name(id=fn_name, ctx=ast.Load()),
+        args=list(args),
+        keywords=[ast.keyword(arg=k, value=v) for k, v in kwargs.items()]
+    ))
+
+
+
+def _reduce_fn(fn_name: str):
+    def reduce_fn_inner(state: SourcerorState, eqn):
+        invars = [_astify_atom(state, v) for v in eqn.invars]
+        outvars = _astify_outvars(state, eqn.outvars)
+        if eqn.params:
+            params = eqn.params.copy()
+            params['axis'] = tuple(params['axes'])
+            del params['axes']
+            call_op = ast.Call(
+                func=ast.Name(id=fn_name, ctx=ast.Load()),
+                args=invars,
+                keywords=[ast.keyword(arg=k, value=_astify_value(v)) for k, v in params.items()]
+            )
+        else:
+            call_op = ast.Call(
+                func=ast.Name(id=fn_name, ctx=ast.Load()),
+                args=invars,
+                keywords=[]
+            )
+
+        return ast.Assign(outvars, call_op)
+
+    return reduce_fn_inner
+
+
+prim_to_python = {
+}
+
+register_prim_handler('add', _binop_fn(ast.Add()))
+register_prim_handler('sub', _binop_fn(ast.Sub()))
+register_prim_handler('mul', _binop_fn(ast.Mult()))
+register_prim_handler('div', _binop_fn(ast.Div()))
+register_prim_handler('neg', normal_fn('jax.lax.neg'))
+register_prim_handler('lt', _cmpop_fn(ast.Lt()))
+register_prim_handler('gt', _cmpop_fn(ast.Gt()))
+register_prim_handler('le', _cmpop_fn(ast.LtE()))
+register_prim_handler('ge', _cmpop_fn(ast.GtE()))
+register_prim_handler('eq', _cmpop_fn(ast.Eq()))
+register_prim_handler('ne', _cmpop_fn(ast.NotEq()))
+register_prim_handler('min', normal_fn('jax.lax.min'))
+register_prim_handler('max', normal_fn('jax.lax.max'))
+register_prim_handler('select_n', normal_fn('jax.lax.select_n'))
+register_prim_handler('squeeze', normal_fn('jax.lax.squeeze'))
+register_prim_handler('broadcast', normal_fn('jax.lax.broadcast'))
+register_prim_handler('reduce_sum', _reduce_fn('jax.numpy.sum'))
+register_prim_handler('transpose', normal_fn('jax.lax.transpose'))
 
 
 def _maybe_wrap_fn_for_leaves(node, f, num_args):
@@ -88,7 +194,7 @@ def _maybe_wrap_fn_for_leaves(node, f, num_args):
 
     return wrapped_node
 
-def jaxpr_to_py_ast(state: _SourcererState, jaxpr, fn_name="function"):
+def jaxpr_to_py_ast(state: SourcerorState, jaxpr, fn_name="function"):
     # Generate argument declarations
     ast_args = [ast.arg(arg=state.str_name(var), annotation=None) for var in jaxpr.invars]
     ast_args = ast.arguments(args=ast_args, vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[], posonlyargs=[])
@@ -203,6 +309,7 @@ def _eval_eqn(eqn, vals) -> Union[Jaxpr, tuple, list, jnp.ndarray]:
     return out
 
 
+@primitive_handler('dot_general')
 def _astify_dot_general(state, eqn):
     x, y = eqn.invars
     d = eqn.params['dimension_numbers']
@@ -228,6 +335,7 @@ def _astify_dot_general(state, eqn):
     outvars = _astify_outvars(state, eqn.outvars)
     return ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.lax', ctx=ast.Load()), attr='dot_general', ctx=ast.Load()), args=invars, keywords=[]))
 
+@primitive_handler('dynamic_slice')
 def _sourcify_dynamic_slice(state, eqn):
     sliced = eqn.invars[0]
     invars = ast.Tuple(elts=[_astify_atom(state, var) for var in eqn.invars[1:]], ctx=ast.Load())
@@ -244,6 +352,7 @@ def _sourcify_dynamic_slice(state, eqn):
     ))
 
 
+@primitive_handler('slice')
 def _sourcify_slice(state, eqn):
     sliced = eqn.invars[0]
     # invars = ast.Tuple(elts=[_astify_atom(state, var) for var in eqn.invars[1:]], ctx=ast.Load())
@@ -262,6 +371,7 @@ def _sourcify_slice(state, eqn):
     ))
 
 
+@primitive_handler('dynamic_update_slice')
 def _sourcify_dynamic_update_slice(state, eqn):
     sliced = eqn.invars[0]
     # the first two arguments are the sliced array and the update array
@@ -282,6 +392,7 @@ def _sourcify_dynamic_update_slice(state, eqn):
     ))
 
 
+@primitive_handler('convert_element_type')
 def _astify_convert_element_type(state, eqn):
     # now we use ast
     outvars = _astify_outvars(state, eqn.outvars)
@@ -345,7 +456,7 @@ def _astify_array(value):
         keywords=[ast.keyword(arg='dtype', value=_astify_value(value.dtype))]
     )
 
-def _astify_atom(state: _SourcererState, var: Union[Literal, Var]):
+def _astify_atom(state: SourcerorState, var: Union[Literal, Var]):
     if isinstance(var, Literal):
         return _astify_value(var.val)
     elif isinstance(var, Var):
@@ -403,52 +514,14 @@ def maybe_untuple_vars(var, is_tuple):
 
 
 
-def assign_stmt(call_expr: Callable):
-    def binop_fn(state, eqn):
-        invars = [_astify_atom(state, v) for v in eqn.invars]
-        outvars = _astify_outvars(state, eqn.outvars)
-        return ast.Assign(outvars, call_expr(*invars,
-                                             **{k: _astify_value(v) for k, v in eqn.params.items()}
-                                             ))
-    return binop_fn
 
-def binop_fn(op: ast.operator):
-    return assign_stmt(lambda x, y: ast.BinOp(left=x, op=op, right=y))
 
-def cmpop_fn(op: ast.cmpop):
-    return assign_stmt(lambda x, y: ast.Compare(left=x, ops=[op], comparators=[y]))
 
-def normal_fn(fn_name):
-    return assign_stmt(lambda *args, **kwargs: ast.Call(
-        func=ast.Name(id=fn_name, ctx=ast.Load()),
-        args=list(args),
-        keywords=[ast.keyword(arg=k, value=v) for k, v in kwargs.items()]
-    ))
 
-def _reduce_fn(fn_name: str):
-    def reduce_fn_inner(state: _SourcererState, eqn):
-        invars = [_astify_atom(state, v) for v in eqn.invars]
-        outvars = _astify_outvars(state, eqn.outvars)
-        if eqn.params:
-            params = eqn.params.copy()
-            params['axis'] = tuple(params['axes'])
-            del params['axes']
-            call_op = ast.Call(
-                func=ast.Name(id=fn_name, ctx=ast.Load()),
-                args=invars,
-                keywords=[ast.keyword(arg=k, value=_astify_value(v)) for k, v in params.items()]
-            )
-        else:
-            call_op = ast.Call(
-                func=ast.Name(id=fn_name, ctx=ast.Load()),
-                args=invars,
-                keywords=[]
-            )
 
-        return ast.Assign(outvars, call_op)
 
-    return reduce_fn_inner
 
+@primitive_handler('scan')
 def _astify_scan(state, eqn):
     assert eqn.primitive.name == 'scan'
 
@@ -603,6 +676,7 @@ def _astify_map(state, eqn):
     return [fn_ast, assign]
 
 
+@primitive_handler('closed_call')
 def _astify_closed_call(state, eqn):
     # out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr,
     #                          {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
@@ -626,6 +700,7 @@ def _astify_closed_call(state, eqn):
 
     return [fn_ast, assign]
 
+@primitive_handler('pjit')
 def _astify_pjit(state, eqn):
     # this one's a real pain.
     # pjit's params are :
@@ -682,10 +757,8 @@ def _astify_pjit(state, eqn):
     return [fn_ast, assign]
 
 
-
-
-
-def _astify_remat(state: _SourcererState, eqn):
+@primitive_handler('remat2')
+def _astify_remat(state: SourcerorState, eqn):
     # out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr,
     #                          {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
     call_japr = constant_fold_jaxpr(eqn.params['jaxpr'])
@@ -715,6 +788,8 @@ def _astify_remat(state: _SourcererState, eqn):
 
     return [fn_ast, lam, assign]
 
+
+@primitive_handler('reshape')
 def _astify_reshape(state, eqn):
     # the lax reshape is a bit different, because it can combine a transpose and reshape into one.
     # np.reshape(np.transpose(operand, dimensions), new_sizes)
@@ -741,11 +816,13 @@ def _astify_reshape(state, eqn):
     return [assign]
 
 
+@primitive_handler('add_any')
 def _astify_add_any(state, eqn):
     # add_any is a weird undocumented jax primitive. best guess is it adds?
-    return binop_fn(ast.Add())(state, eqn)
+    return _binop_fn(ast.Add())(state, eqn)
 
 
+@primitive_handler('broadcast_in_dim')
 def _astify_broadcast_in_dim(state, eqn):
     # broadcast_in_dim is how zeros, ones, full, etc are implemented,
     # so we prefer to use those where possible
@@ -797,6 +874,7 @@ def _astify_broadcast_in_dim(state, eqn):
             value=call
         )]
 
+@primitive_handler('random_wrap')
 def _astify_random_wrap(state, eqn):
     # we treat this as a noop
     return ast.Assign(
@@ -806,40 +884,6 @@ def _astify_random_wrap(state, eqn):
 
 
 
-prim_to_python = {
-    'add': binop_fn(ast.Add()),
-    'sub': binop_fn(ast.Sub()),
-    'mul': binop_fn(ast.Mult()),
-    'div': binop_fn(ast.Div()),
-    'neg': normal_fn('jax.lax.neg'),
-    'lt': cmpop_fn(ast.Lt()),
-    'gt': cmpop_fn(ast.Gt()),
-    'le': cmpop_fn(ast.LtE()),
-    'ge': cmpop_fn(ast.GtE()),
-    'eq': cmpop_fn(ast.Eq()),
-    'ne': cmpop_fn(ast.NotEq()),
-    'min': normal_fn('jax.lax.min'),
-    'max': normal_fn('jax.lax.max'),
-    'convert_element_type': _astify_convert_element_type,
-    'select_n': normal_fn('jax.lax.select_n'),
-    'dynamic_slice': _sourcify_dynamic_slice,
-    'dynamic_update_slice': _sourcify_dynamic_update_slice,
-    'slice': _sourcify_slice,
-    'squeeze': normal_fn('jax.lax.squeeze'),
-    'dot_general': _astify_dot_general,
-    # 'broadcast_in_dim': normal_fn('jax.lax.broadcast_in_dim'),
-    'broadcast_in_dim': _astify_broadcast_in_dim,
-    'broadcast': normal_fn('jax.lax.broadcast'),
-    'reduce_sum': _reduce_fn('jax.numpy.sum'),
-    'transpose': normal_fn('jax.lax.transpose'),
-    'scan': _astify_scan,
-    'closed_call': _astify_closed_call,
-    'pjit': _astify_pjit,
-    'remat2': _astify_remat,
-    'reshape': _astify_reshape,
-    'add_any': _astify_add_any,
-    'random_wrap': _astify_random_wrap,
-}
 
 constant_fold_blacklist = {
     'broadcast_in_dim',

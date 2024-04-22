@@ -1,6 +1,6 @@
 from functools import partial
 
-from jax_automin.interpreter import automin_function
+from jax_sourceror.interpreter import sourcerize
 import jax
 import jax.numpy as jnp
 
@@ -11,7 +11,7 @@ def test_jaxpr_to_source_simple():
     def f(x):
         return x + 1
 
-    source = automin_function(f, jnp.array([1, 2, 3]))
+    source = sourcerize(f, jnp.array([1, 2, 3]))
 
     assert source == """def f(a):
     b = a + 1
@@ -24,7 +24,7 @@ def test_jaxpr_to_source_matmul():
     def f(x, y):
         return jnp.matmul(x, y)
 
-    source = automin_function(f, jnp.array([[1, 2], [3, 4]]), jnp.array([[1, 2], [3, 4]]))
+    source = sourcerize(f, jnp.array([[1, 2], [3, 4]]), jnp.array([[1, 2], [3, 4]]))
 
     assert source == """def f(a, b):
     c = jax.numpy.matmul(a, b)
@@ -34,7 +34,7 @@ def test_jaxpr_to_source_matmul():
 
 
 def check_roundtrip(f, *args, **kwargs):
-    source = automin_function(f, *args, **kwargs)
+    source = sourcerize(f, *args, **kwargs)
     f2 = _parse_sandboxed(source, f.__name__)
 
     f_results = f(*args, **kwargs)
