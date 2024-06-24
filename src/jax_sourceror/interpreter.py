@@ -402,7 +402,7 @@ def _astify_dot_general(state, eqn):
     if d == (((1,), (0,)), ((), ())) and precision == None:
         invars = [_astify_atom(state, x), _astify_atom(state, y)]
         outvars = _astify_outvars(state, eqn.outvars)
-        out = ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='matmul', ctx=ast.Load()), args=invars, keywords=[]))
+        out = ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=ast.Name(id='jnp', ctx=ast.Load()), attr='matmul', ctx=ast.Load()), args=invars, keywords=[]))
         if not has_dtype:
             out = ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=out.value, attr='astype', ctx=ast.Load()), args=[_astify_value(preferred_element_type)], keywords=[]))
 
@@ -450,7 +450,7 @@ def _astify_dot_general(state, eqn):
     if preferred_element_type is not None:
         keywords.append(ast.keyword(arg='preferred_element_type', value=_astify_value(preferred_element_type)))
 
-    return ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='einsum', ctx=ast.Load()), args=invars,
+    return ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=ast.Name(id='jnp', ctx=ast.Load()), attr='einsum', ctx=ast.Load()), args=invars,
                                                       keywords=keywords))
 
 
@@ -572,7 +572,7 @@ def _astify_array(value):
 
     return ast.Call(
         func=ast.Attribute(
-            value=ast.Name(id='jax.numpy', ctx=ast.Load()),
+            value=ast.Name(id='jnp', ctx=ast.Load()),
             attr='array',
             ctx=ast.Load()
         ),
@@ -598,14 +598,14 @@ def _astify_value(value):
     elif isinstance(value, (tuple, list)):
         return ast.Tuple(elts=[_astify_value(v) for v in value], ctx=ast.Load())
     elif isinstance(value, jnp.dtype):
-        # return ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='dtype', ctx=ast.Load()), args=[ast.Constant(value=str(value))], keywords=[])
+        # return ast.Call(func=ast.Attribute(value=ast.Name(id="jnp", ctx=ast.Load()), attr='dtype', ctx=ast.Load()), args=[ast.Constant(value=str(value))], keywords=[])
         if value.name in ('float32', 'float64', 'int32', 'int64', 'bfloat16', 'float16'):
             # return ast.Constant(value=getattr(jnp, value.name))
-            return ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr=value.name, ctx=ast.Load())
+            return ast.Attribute(value=ast.Name(id="jnp", ctx=ast.Load()), attr=value.name, ctx=ast.Load())
         elif value.name == 'bool':
-            return ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='bool_', ctx=ast.Load())
+            return ast.Attribute(value=ast.Name(id="jnp", ctx=ast.Load()), attr='bool_', ctx=ast.Load())
         else:
-            return ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='dtype', ctx=ast.Load()), args=[ast.Constant(value=str(value))], keywords=[])
+            return ast.Call(func=ast.Attribute(value=ast.Name(id="jnp", ctx=ast.Load()), attr='dtype', ctx=ast.Load()), args=[ast.Constant(value=str(value))], keywords=[])
     elif value is _UNSPECIFIED:
         return ast.Attribute(value=ast.Name(id='jax.experimental.pjit', ctx=ast.Load()), attr='_UNSPECIFIED', ctx=ast.Load())
     elif isinstance(value, enum.Enum):
@@ -651,14 +651,6 @@ def maybe_untuple_vars(var, is_tuple):
         return ast.Starred(value=var, ctx=ast.Load())
     else:
         return var
-
-
-
-
-
-
-
-
 
 
 @primitive_handler('scan')
@@ -930,24 +922,35 @@ def _astify_remat(state: SourcerorState, eqn):
     invars = [_astify_atom(state, v) for v in eqn.invars]
     outvars = _astify_outvars(state, eqn.outvars)
 
-    lam = ast.Assign(
-        targets=[ast.Name(id=f"ckpt_{fn_name}", ctx=ast.Store())],
-        # value=ast.parse(f"jax.checkpoint({fn_name})").body[0]
-        value=ast.Call(
-            func=ast.Name(id='jax.checkpoint', ctx=ast.Load()),
-            args=[ast.Name(id=fn_name, ctx=ast.Load())],
-            keywords=[])
-    )
+    prevent_cse = _astify_value(eqn.params.get('prevent_cse', False))
+
+    policy = eqn.params.get('policy')
+
+    if policy is not None:
+        warnings.warn(f"Remat2 policy {policy} is not supported.")
+
+    has_args = prevent_cse
+
+    # if we have args, we wrap checkpoint in a partial
+    if has_args:
+        checkpoint = ast.Call(ast.Name('partial'), [ast.Name(id='jax.checkpoint', ctx=ast.Load())], [ast.keyword(arg='prevent_cse', value=prevent_cse)])
+    else:
+        checkpoint = ast.Name(id='jax.checkpoint', ctx=ast.Load())
+
+    # apply as a decorator
+    fn_ast.decorator_list.append(checkpoint)
 
     assign = ast.Assign(
         targets=outvars,
         value=ast.Call(
-            func=ast.Name(id=f"ckpt_{fn_name}"),
+            func=ast.Name(id=fn_name, ctx=ast.Load()),
             args=invars,
             keywords=[]
         ))
 
-    return [fn_ast, lam, assign]
+    return [fn_ast, assign]
+
+
 
 
 @primitive_handler('custom_vjp_call_jaxpr')
@@ -1089,7 +1092,7 @@ def _astify_iota(state, eqn):
 
     arange = ast.Call(
                 func=ast.Attribute(
-                    value=ast.Name(id='jax.numpy', ctx=ast.Load()),
+                    value=ast.Name(id="jnp", ctx=ast.Load()),
                     attr='arange',
                     ctx=ast.Load()
                 ),
@@ -1106,7 +1109,7 @@ def _astify_iota(state, eqn):
 
     broadcast = ast.Call(
         func=ast.Attribute(
-            value=ast.Name(id='jax.numpy', ctx=ast.Load()),
+            value=ast.Name(id="jnp", ctx=ast.Load()),
             attr='broadcast_to',
             ctx=ast.Load()
         ),
@@ -1173,7 +1176,7 @@ def _astify_broadcast_in_dim(state, eqn):
         if constant_value == 0:
             call = ast.Call(
                 ast.Attribute(
-                    value=ast.Name(id='jax.numpy', ctx=ast.Load()),
+                    value=ast.Name(id="jnp", ctx=ast.Load()),
                     attr='zeros',
                     ctx=ast.Load()
                 ),
@@ -1183,7 +1186,7 @@ def _astify_broadcast_in_dim(state, eqn):
         elif constant_value == 1:
             call = ast.Call(
                 ast.Attribute(
-                    value=ast.Name(id='jax.numpy', ctx=ast.Load()),
+                    value=ast.Name(id="jnp", ctx=ast.Load()),
                     attr='ones',
                     ctx=ast.Load()
                 ),
@@ -1193,7 +1196,7 @@ def _astify_broadcast_in_dim(state, eqn):
         else:
             call = ast.Call(
                 ast.Attribute(
-                    value=ast.Name(id='jax.numpy', ctx=ast.Load()),
+                    value=ast.Name(id="jnp", ctx=ast.Load()),
                     attr='full',
                     ctx=ast.Load()
                 ),

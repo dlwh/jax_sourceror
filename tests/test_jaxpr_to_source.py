@@ -1,3 +1,4 @@
+import functools
 import textwrap
 from functools import partial
 
@@ -56,7 +57,7 @@ def check_roundtrip(f, **config_kwargs):
 
 
 def _parse_sandboxed(source, fn_name):
-    g = {'jax': jax, 'jaxtyping': jaxtyping}
+    g = {'jax': jax, 'jaxtyping': jaxtyping, 'jnp': jnp, 'functools': functools, 'partial': partial}
     l = {}
     source = f"""
 from jaxtyping import *
