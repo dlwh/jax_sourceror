@@ -2,13 +2,14 @@ import dataclasses
 import enum
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Union
+from typing import Callable, Optional, Union
 
 import ast_comments as ast
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src.core import ClosedJaxpr
 from jax._src.source_info_util import user_frame
 from jax.sharding import NamedSharding
 from jax._src.custom_derivatives import CustomJVPCallPrimitive
@@ -54,7 +55,10 @@ class SourcerorState():
         self._skolem_count += 1
         return f"{prefix}_{self._skolem_count}"
 
-    def heuristic_fn_skolem(self, jaxpr: Jaxpr, default="fn"):
+    def heuristic_fn_skolem(self, jaxpr: Jaxpr, default: Optional[str] = None):
+        if default is None:
+            default = "fn"
+
         name = _attempt_to_sniff_fn_name_for_jaxpr(jaxpr) or default
         if name in self._used_fn_names:
             return self.skolem(name)
@@ -67,13 +71,13 @@ class SourcerorState():
 def sourcerize(f, *, use_jax_typing: bool = False):
     def return_fn(*args, **kwargs):
         closed_jaxpr = eqx.filter_make_jaxpr(f)(*args, **kwargs)[0]
-        jaxpr = constant_fold_jaxpr(closed_jaxpr.jaxpr)
+        jaxpr = closed_jaxpr.jaxpr
         state = SourcerorState(use_jax_typing=use_jax_typing)
         try:
             name = f.__name__
         except AttributeError:
             name = "unknown"
-        node = jaxpr_to_py_ast(state, jaxpr, fn_name=name)
+        node = jaxpr_to_py_ast(state, jaxpr, fn_name=name, unique_fn_name=False)
         node = _maybe_wrap_fn_for_leaves(node, f, len(args) + len(kwargs))
         return _render_ast(node)
 
@@ -192,6 +196,7 @@ register_prim_handler('squeeze', normal_fn('jax.lax.squeeze'))
 register_prim_handler('broadcast', normal_fn('jax.lax.broadcast'))
 register_prim_handler('reduce_sum', _reduce_fn('jax.numpy.sum'))
 register_prim_handler('transpose', normal_fn('jax.lax.transpose'))
+register_prim_handler('clamp', normal_fn('jax.lax.clamp'))
 
 
 def _maybe_wrap_fn_for_leaves(node, f, num_args):
@@ -263,13 +268,14 @@ def _astify_jax_typing_annotation(state, aval):
 
 
 
+def jaxpr_to_py_ast(state: SourcerorState, jaxpr, fn_name: Optional[str] = None, *, unique_fn_name: bool = True):
+    if isinstance(jaxpr, ClosedJaxpr):
+        jaxpr = jaxpr.jaxpr
+    if fn_name is None or unique_fn_name:
+        fn_name = state.heuristic_fn_skolem(jaxpr, default=fn_name)
 
-
-
-
-
-def jaxpr_to_py_ast(state: SourcerorState, jaxpr, fn_name="function"):
     # Generate argument declarations
+    jaxpr = constant_fold_jaxpr(jaxpr)
     annotations = [_astify_jax_typing_annotation(state, v.aval) for v in jaxpr.invars]
     ast_args = [ast.arg(arg=state.str_name(var), annotation=ann) for var, ann in zip(jaxpr.invars, annotations)]
     ast_args = ast.arguments(args=ast_args, vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[], posonlyargs=[])
@@ -680,17 +686,15 @@ def _astify_scan(state, eqn):
     carries = eqn.invars[num_consts:num_consts + num_carry]
     xs = eqn.invars[num_consts + num_carry:]
 
-    jaxpr = eqn.params['jaxpr']
+    jaxpr = eqn.params['jaxpr'].jaxpr
 
     if num_consts != 0:
         # we want to construct an environment where we partial eval the function using the constants as the env
-        env = dict(zip(jaxpr.jaxpr.invars, constant_args))
-        jaxpr = partial_eval_jaxpr(jaxpr.jaxpr, env)
-    else:
-        jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
+        env = dict(zip(jaxpr.invars, constant_args))
+        jaxpr = partial_eval_jaxpr(jaxpr, env, elide_unused_invars=True)
 
-    fn_name = state.heuristic_fn_skolem(jaxpr)
-    fn_ast = jaxpr_to_py_ast(state, jaxpr, fn_name)
+    fn_ast = jaxpr_to_py_ast(state, jaxpr)
+    fn_name = fn_ast.name
 
     length = _astify_value(eqn.params['length'])
     unroll = _astify_value(eqn.params['unroll'])
@@ -797,10 +801,9 @@ def _astify_map(state, eqn):
     assert eqn.params['num_carry'] == 0
 
     jaxpr = eqn.params['jaxpr']
-    jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
 
-    fn_name = state.skolem('fn')
-    fn_ast = jaxpr_to_py_ast(state, jaxpr, fn_name)
+    fn_ast = jaxpr_to_py_ast(state, jaxpr)
+    fn_name = fn_ast.name
 
     # map is a bit funny, because the jaxpr takes K args, but the jax.lax.map function takes a single tuple arg
     # so we need to use a lambda to redirect the call
@@ -842,10 +845,9 @@ def _astify_closed_call(state, eqn):
     #                          {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
     raw_jaxpr = eqn.params['call_jaxpr'].jaxpr
     literal_args = {k: v.val for k, v in zip(raw_jaxpr.invars, eqn.invars) if isinstance(v, Literal)}
-    call_jaxpr = partial_eval_jaxpr(raw_jaxpr, literal_args)
-    fn_name = state.heuristic_fn_skolem(call_jaxpr)
-
-    fn_ast = jaxpr_to_py_ast(state, call_jaxpr, fn_name)
+    call_jaxpr = partial_eval_jaxpr(raw_jaxpr, literal_args, elide_unused_invars=False)
+    fn_ast = jaxpr_to_py_ast(state, call_jaxpr)
+    fn_name = fn_ast.name
 
     invars = [_astify_atom(state, v) for v in eqn.invars if not isinstance(v, Literal)]
     outvars = _astify_outvars(state, eqn.outvars)
@@ -881,9 +883,8 @@ def _astify_pjit(state, eqn):
     can_ignore_donated = not any(donated_invars)
 
     # preprocess the function
-    jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
-    fn_name = state.skolem(name)
-    fn_ast = jaxpr_to_py_ast(state, jaxpr, fn_name)
+    fn_ast = jaxpr_to_py_ast(state, jaxpr, name)
+    fn_name = fn_ast.name
 
     keywords = []
 
@@ -923,10 +924,8 @@ def _astify_pjit(state, eqn):
 def _astify_remat(state: SourcerorState, eqn):
     # out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr,
     #                          {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
-    call_japr = constant_fold_jaxpr(eqn.params['jaxpr'])
-    fn_name = state.skolem('fn')
-
-    fn_ast = jaxpr_to_py_ast(state, call_japr, fn_name)
+    fn_ast = jaxpr_to_py_ast(state, constant_fold_jaxpr(eqn.params['jaxpr']))
+    fn_name = fn_ast.name
 
     invars = [_astify_atom(state, v) for v in eqn.invars]
     outvars = _astify_outvars(state, eqn.outvars)
@@ -967,10 +966,8 @@ def _astify_custom_vjp_call_jaxpr(state, eqn):
     # out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr,
     #                          {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
     closed_jaxpr = eqn.params['fun_jaxpr']
-    call_jaxpr = constant_fold_jaxpr(closed_jaxpr.jaxpr)
-    fn_name = state.skolem('fn')
-
-    fn_ast = jaxpr_to_py_ast(state, call_jaxpr, fn_name)
+    fn_ast = jaxpr_to_py_ast(state, closed_jaxpr)
+    fn_name = fn_ast.name
 
     invars = [_astify_atom(state, v) for v in eqn.invars]
     outvars = _astify_outvars(state, eqn.outvars)
@@ -1013,12 +1010,6 @@ def _astify_while(state, eqn):
     body_jaxpr = eqn.params['body_jaxpr']
     cond_jaxpr = eqn.params['cond_jaxpr']
 
-    body_jaxpr = constant_fold_jaxpr(body_jaxpr.jaxpr)
-    cond_jaxpr = constant_fold_jaxpr(cond_jaxpr.jaxpr)
-
-    body_fn_name = state.heuristic_fn_skolem(body_jaxpr, "body")
-    cond_fn_name = state.heuristic_fn_skolem(cond_jaxpr, "cond")
-
     body_nconsts = eqn.params['body_nconsts']
     cond_nconsts = eqn.params['cond_nconsts']
 
@@ -1026,13 +1017,15 @@ def _astify_while(state, eqn):
         env = dict(zip(cond_jaxpr.invars, eqn.invars[:cond_nconsts]))
         cond_jaxpr = partial_eval_jaxpr(cond_jaxpr, env, elide_unused_invars=False)
 
-    cond_fn_ast = jaxpr_to_py_ast(state, cond_jaxpr, cond_fn_name)
+    cond_fn_ast = jaxpr_to_py_ast(state, cond_jaxpr)
+    cond_fn_name = cond_fn_ast.name
 
     if body_nconsts != 0:
         env = dict(zip(body_jaxpr.invars, eqn.invars[cond_nconsts:cond_nconsts+body_nconsts]))
         body_jaxpr = partial_eval_jaxpr(body_jaxpr, env, elide_unused_invars=False)
 
-    body_fn_ast = jaxpr_to_py_ast(state, body_jaxpr, body_fn_name)
+    body_fn_ast = jaxpr_to_py_ast(state, body_jaxpr)
+    body_fn_name = body_fn_ast.name
 
     true_args = eqn.invars[cond_nconsts+body_nconsts:]
 
@@ -1086,40 +1079,50 @@ def _astify_while(state, eqn):
     return [body_fn_ast, cond_fn_ast, assign]
 
 
+def _astize_fn(state, jaxpr, name):
+    return jaxpr_to_py_ast(state, jaxpr, name)
+
+
 @primitive_handler('cond')
 def _astify_cond(state, eqn):
     # out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr,
     #                          {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
-    false_jaxpr, true_jaxpr = eqn.params['branches']
+    branches = eqn.params['branches']
 
-    true_jaxpr = constant_fold_jaxpr(true_jaxpr.jaxpr)
-    false_jaxpr = constant_fold_jaxpr(false_jaxpr.jaxpr)
+    ast_branches = [jaxpr_to_py_ast(state, jaxpr) for jaxpr in branches]
 
     pred_var, *rest_args = eqn.invars
-
-    true_fn_name = state.heuristic_fn_skolem(true_jaxpr, "true")
-    false_fn_name = state.heuristic_fn_skolem(false_jaxpr, "false")
-
-    true_fn_ast = jaxpr_to_py_ast(state, true_jaxpr, true_fn_name)
-    false_fn_ast = jaxpr_to_py_ast(state, false_jaxpr, false_fn_name)
-
     pred_ast = _astify_atom(state, pred_var)
     invars = [_astify_atom(state, v) for v in rest_args]
-
     outvars = _astify_outvars(state, eqn.outvars)
-    false_name = ast.Name(id=false_fn_name, ctx=ast.Load())
-    true_name = ast.Name(id=true_fn_name, ctx=ast.Load())
 
+    branch_names = [ast.Name(id=ast_branch.name, ctx=ast.Load()) for ast_branch in ast_branches]
 
-    assign = ast.Assign(
-        targets=outvars,
-        value=ast.Call(
-            func=ast.Name(id='jax.lax.cond', ctx=ast.Load()),
-            args=[pred_ast, true_name, false_name, *invars],
-            keywords=[]
-        ))
+    if len(branches) == 2:
+        false_fn_ast, true_fn_ast = ast_branches
+        false_name, true_name = branch_names
 
-    return [true_fn_ast, false_fn_ast, assign]
+        assign = ast.Assign(
+            targets=outvars,
+            value=ast.Call(
+                func=ast.Name(id='jax.lax.cond', ctx=ast.Load()),
+                args=[pred_ast, true_name, false_name, *invars],
+                keywords=[]
+            ))
+
+        return [true_fn_ast, false_fn_ast, assign]
+
+    else:
+        # jax.lax.switch
+        assign = ast.Assign(
+            targets=outvars,
+            value=ast.Call(
+                func=ast.Name(id='jax.lax.switch', ctx=ast.Load()),
+                args=[pred_ast, ast.List(elts=branch_names), *invars],
+                keywords=[]
+            ))
+
+        return ast_branches + [assign]
 
 
 

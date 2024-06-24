@@ -30,7 +30,7 @@ def test_jaxpr_to_source_matmul():
     source = sourcerize(f, use_jax_typing=False)(jnp.array([[1, 2], [3, 4]]), jnp.array([[1, 2], [3, 4]]))
 
     assert source == """def f(a, b):
-    c = jax.numpy.matmul(a, b)
+    c = jnp.matmul(a, b)
     return c"""
 
     check_roundtrip(f)(jnp.array([[1, 2], [3, 4]]), jnp.array([[1, 2], [3, 4]]))
@@ -255,17 +255,30 @@ def test_cond():
     check_roundtrip(f)(x)
 
 
+def test_switch():
+    def f(x):
+        def fn_a(x):
+            return x + 1
 
-# jax.lax.scan
-# jax.lax.while_loop
-# jax.lax.cond
+        def fn_b(x):
+            return x + 2
+
+        def fn_c(x):
+            return x + 3
+
+        return jax.lax.switch(x, [fn_a, fn_b, fn_c], x)
+
+
+    x = jnp.array(1)
+
+    check_roundtrip(f)(x)
+
+
+
 # jax.lax.fori_loop
-# jax.lax.map
-# jax.lax.dynamic_slice_in_dim
 # jax.lax.dynamic_update_slice
 # jax.lax.dynamic_update_index_in_dim
 # jax.lax.dynamic_slice
-# jax.lax.dynamic_update_slice
 # jax.lax.dynamic_index_in_dim
 # jax.lax.dynamic_update_index_in_dim
 # jax.lax.dynamic_slice_in_dim
