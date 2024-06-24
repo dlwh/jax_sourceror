@@ -226,6 +226,60 @@ def test_einsum():
     return c""".strip())
 
 
+def test_while_loop():
+    def f(y):
+        def loop(args):
+            x, y = args
+            return x + y, y
+
+        def cond(args):
+            return args[0] < 10
+
+        return jax.lax.while_loop(cond, loop, (0, y))
+
+    y = jnp.array(1)
+    check_roundtrip(f)(y)
+
+
+def test_cond():
+    def f(x):
+        def true_fn(x):
+            return x + 1
+
+        def false_fn(x):
+            return x + 2
+
+        return jax.lax.cond(x > 0, true_fn, false_fn, x)
+
+    x = jnp.array(1)
+    check_roundtrip(f)(x)
+
+
+
+# jax.lax.scan
+# jax.lax.while_loop
+# jax.lax.cond
+# jax.lax.fori_loop
+# jax.lax.map
+# jax.lax.dynamic_slice_in_dim
+# jax.lax.dynamic_update_slice
+# jax.lax.dynamic_update_index_in_dim
+# jax.lax.dynamic_slice
+# jax.lax.dynamic_update_slice
+# jax.lax.dynamic_index_in_dim
+# jax.lax.dynamic_update_index_in_dim
+# jax.lax.dynamic_slice_in_dim
+# jax.lax.dynamic_update_slice_in_dim
+# jax.lax.gather
+# jax.lax.scatter
+# jax.lax.scatter_add
+# jax.lax.scatter_mul
+
+
+
+
+
+
 # want to handle this (complex) case:
 # { lambda a:u32[2] b:f32[128,72] c:f32[16,72] d:i32[4] e:f32[4,72] f:f32[4,72] g:f32[4,72,3,8,9]
 #     h:f32[4,3,8,9] i:f32[4,8,9,72] j:f32[4,72] k:f32[4,72] l:f32[4,72] m:f32[4,72,288]
