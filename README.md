@@ -204,7 +204,7 @@ Is it correct? I think so. (It definitely passes my unit test!)
 ```python
 from jax_sourceror import sourcerize
 
-source_code = sourcerize(grad_fn, *args, **kwargs)
+source_code = sourcerize(grad_fn)(*args, **kwargs)
 
 print(source_code)
 ```

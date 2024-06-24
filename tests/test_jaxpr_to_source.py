@@ -1,7 +1,9 @@
+import textwrap
 from functools import partial
 
 from jax_sourceror.interpreter import sourcerize
 import jax
+import jaxtyping
 import jax.numpy as jnp
 
 
@@ -11,7 +13,7 @@ def test_jaxpr_to_source_simple():
     def f(x):
         return x + 1
 
-    source = sourcerize(f, jnp.array([1, 2, 3]))
+    source = sourcerize(f, use_jax_typing=False)(jnp.array([1, 2, 3]))
 
     assert source == """def f(a):
     b = a + 1
@@ -24,35 +26,42 @@ def test_jaxpr_to_source_matmul():
     def f(x, y):
         return jnp.matmul(x, y)
 
-    source = sourcerize(f, jnp.array([[1, 2], [3, 4]]), jnp.array([[1, 2], [3, 4]]))
+    source = sourcerize(f, use_jax_typing=False)(jnp.array([[1, 2], [3, 4]]), jnp.array([[1, 2], [3, 4]]))
 
     assert source == """def f(a, b):
     c = jax.numpy.matmul(a, b)
     return c"""
 
-    check_roundtrip(f, jnp.array([[1, 2], [3, 4]]), jnp.array([[1, 2], [3, 4]]))
+    check_roundtrip(f)(jnp.array([[1, 2], [3, 4]]), jnp.array([[1, 2], [3, 4]]))
 
 
-def check_roundtrip(f, *args, **kwargs):
-    source = sourcerize(f, *args, **kwargs)
-    f2 = _parse_sandboxed(source, f.__name__)
+def check_roundtrip(f, **config_kwargs):
+    def return_function(*args, **kwargs):
+        source = sourcerize(f, **config_kwargs)(*args, **kwargs)
+        f2 = _parse_sandboxed(source, f.__name__)
 
-    f_results = f(*args, **kwargs)
-    f2_results = f2(*args, **kwargs)
+        f_results = f(*args, **kwargs)
+        f2_results = f2(*args, **kwargs)
 
-    if isinstance(f_results, tuple):
-        assert isinstance(f2_results, tuple)
-        assert len(f_results) == len(f2_results)
-        for a, b in zip(f_results, f2_results):
-            assert jnp.all(a == b)
-    else:
-        assert jnp.all(f_results == f2_results)
-    return f2
+        if isinstance(f_results, tuple):
+            assert isinstance(f2_results, tuple)
+            assert len(f_results) == len(f2_results)
+            for a, b in zip(f_results, f2_results):
+                assert jnp.all(a == b)
+        else:
+            assert jnp.all(f_results == f2_results)
+        return f2
+
+    return return_function
 
 
 def _parse_sandboxed(source, fn_name):
-    g = {'jax': jax}
+    g = {'jax': jax, 'jaxtyping': jaxtyping}
     l = {}
+    source = f"""
+from jaxtyping import *
+
+{source}"""
     exec(source, g, l)
     return l[fn_name]
 
@@ -61,8 +70,8 @@ def test_slice_squeeze():
     def f(x):
         return x[0:2, 0:1, 3]
 
-    f2 = check_roundtrip(f, jnp.arange(4 * 5 * 6).reshape(4, 5, 6))
-    check_roundtrip(f2, jnp.arange(4 * 5 * 6).reshape(4, 5, 6))
+    f2 = check_roundtrip(f)(jnp.arange(4 * 5 * 6).reshape(4, 5, 6))
+    check_roundtrip(f2)(jnp.arange(4 * 5 * 6).reshape(4, 5, 6))
 
 
 def test_pseudo_sliding_window_attn_block():
@@ -90,7 +99,7 @@ def test_pseudo_sliding_window_attn_block():
 
     mesh = jax.sharding.Mesh(jax.devices('cpu'), ('data',))
     with mesh:
-        f2 = check_roundtrip(block, x)
+        f2 = check_roundtrip(block)(x)
 
 def test_scan():
     def scanfn(x, y):
@@ -102,7 +111,7 @@ def test_scan():
     def f(x, y):
         return jax.lax.scan(scanfn, x, y)
 
-    f2 = check_roundtrip(f, x, y)
+    f2 = check_roundtrip(f)(x, y)
 
     assert jnp.all(f(x, y)[0] == f2(x, y)[0])
     assert jnp.all(f(x, y)[1] == f2(x, y)[1])
@@ -117,7 +126,7 @@ def test_map():
     def g(x):
         return jax.lax.map(f, x)
 
-    g2 = check_roundtrip(g, x)
+    g2 = check_roundtrip(g)(x)
 
     assert jnp.all(g(x) == g2(x))
 
@@ -131,7 +140,7 @@ def test_map_pytree():
     def g(x, y):
         return jax.lax.map(f, (x, y))
 
-    g2 = check_roundtrip(g, x, x)
+    g2 = check_roundtrip(g)(x, x)
 
     assert jnp.all(g(x, x)[0] == g2(x, x)[0])
     assert jnp.all(g(x, x)[1] == g2(x, x)[1])
@@ -196,10 +205,24 @@ def test_pseudo_sliding_window_attention():
 
     params = (qkv, o)
 
-    f2 = check_roundtrip(grad_fn, params, x)
+    f2 = check_roundtrip(grad_fn)(params, x)
 
+def test_einsum():
+    def f(x, y):
+        return jnp.einsum('cij,cjk->ik', x, y)
 
+    x = jnp.arange(8).reshape(2, 2, 2)
+    y = jnp.arange(8).reshape(2, 2, 2)
 
+    check_roundtrip(f)(x, y)
+
+    source = sourcerize(f, use_jax_typing=True)(x, y)
+
+    assert source.strip() == \
+    textwrap.dedent("""
+    def f(a: Int32[Array, '2 2 2'], b: Int32[Array, '2 2 2']):
+    c = jax.numpy.einsum('acb,abd->cd', a, b, preferred_element_type=jax.numpy.int32)
+    return c""".strip())
 
 
 # want to handle this (complex) case:

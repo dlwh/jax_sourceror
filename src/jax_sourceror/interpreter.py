@@ -1,13 +1,17 @@
-import ast
 import dataclasses
 import enum
 import warnings
 from dataclasses import dataclass
 from typing import Callable, Union
 
+import ast_comments as ast
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src.source_info_util import user_frame
+from jax.sharding import NamedSharding
+from jax._src.custom_derivatives import CustomJVPCallPrimitive
 from jax.experimental.pjit import _UNSPECIFIED
 from jax.core import Literal, Var, Jaxpr
 
@@ -17,7 +21,9 @@ from jax_sourceror.utils import IdentityMap, IdentitySet
 class SourcerorState():
     """State for the auto-minimizer. Basically just in charge of naming variables."""
     _var_names: IdentityMap[Var, str] = dataclasses.field(default_factory=IdentityMap)
+    _used_fn_names: set[str] = dataclasses.field(default_factory=set)
     _skolem_count: int = 0
+    use_jax_typing: bool = True
 
     def name(self, var, ctx=ast.Load()) -> ast.Name:
         return ast.Name(id=self.str_name(var), ctx=ctx)
@@ -37,6 +43,9 @@ class SourcerorState():
 
             name = name[::-1]
 
+            if name == "or":
+                name = "or_"  # or is a keyword
+
             self._var_names[var] = name
 
             return name
@@ -45,20 +54,32 @@ class SourcerorState():
         self._skolem_count += 1
         return f"{prefix}_{self._skolem_count}"
 
+    def heuristic_fn_skolem(self, jaxpr: Jaxpr):
+        name = _attempt_to_sniff_fn_name_for_jaxpr(jaxpr) or "fn"
+        if name in self._used_fn_names:
+            return self.skolem(name)
+        else:
+            self._used_fn_names.add(name)
+            return name
 
-def sourcerize(f, *args, **kwargs):
-    closed_jaxpr = jax.make_jaxpr(f)(*args, **kwargs)
-    jaxpr = constant_fold_jaxpr(closed_jaxpr.jaxpr)
-    state = SourcerorState()
-    try:
-        name = f.__name__
-    except AttributeError:
-        name = "unknown"
-    node = jaxpr_to_py_ast(state, jaxpr, fn_name=name)
-    node = _maybe_wrap_fn_for_leaves(node, f, len(args) + len(kwargs))
-    ast.fix_missing_locations(node)
-    source = ast.unparse(node)
-    return source
+
+
+def sourcerize(f, *, use_jax_typing: bool = False):
+    def return_fn(*args, **kwargs):
+        closed_jaxpr = eqx.filter_make_jaxpr(f)(*args, **kwargs)[0]
+        jaxpr = constant_fold_jaxpr(closed_jaxpr.jaxpr)
+        state = SourcerorState(use_jax_typing=use_jax_typing)
+        try:
+            name = f.__name__
+        except AttributeError:
+            name = "unknown"
+        node = jaxpr_to_py_ast(state, jaxpr, fn_name=name)
+        node = _maybe_wrap_fn_for_leaves(node, f, len(args) + len(kwargs))
+        ast.fix_missing_locations(node)
+        source = ast.unparse(node)
+        return source
+
+    return return_fn
 
 def register_prim_handler(prim_name, handler):
     """
@@ -194,9 +215,57 @@ def _maybe_wrap_fn_for_leaves(node, f, num_args):
 
     return wrapped_node
 
+
+def _astify_jax_typing_annotation(state, aval):
+    # jaxtyping annotations are like Float32[Array, "128 32"]
+    if not state.use_jax_typing:
+        return None
+
+    dtype = aval.dtype
+    shape = aval.shape
+
+    if dtype == jnp.float32:
+        dtype_str = "Float32"
+    elif dtype == jnp.float64:
+        dtype_str = "Float64"
+    elif dtype == jnp.int32:
+        dtype_str = "Int32"
+    elif dtype == jnp.int64:
+        dtype_str = "Int64"
+    elif dtype == jnp.bool_:
+        dtype_str = "Bool"
+    elif dtype == jnp.bfloat16:
+        dtype_str = "BFloat16"
+    elif dtype == jnp.float16:
+        dtype_str = "Float16"
+    else:
+        warnings.warn(f"Unknown dtype for jaxtyping {dtype}")
+        dtype_str = "Shaped"
+
+    if len(shape) == 0:
+        return ast.Subscript(
+            value=ast.Name(id="Scalar", ctx=ast.Load()),
+            slice=ast.Name(id=dtype_str, ctx=ast.Load()),
+        )
+
+    shape_str = " ".join(str(s) for s in shape)
+
+    return ast.Subscript(
+        value=ast.Name(id=dtype_str, ctx=ast.Load()),
+        slice=ast.Tuple(elts=[ast.Name(id="Array", ctx=ast.Load()), ast.Str(shape_str)], ctx=ast.Load()),
+    )
+
+
+
+
+
+
+
+
 def jaxpr_to_py_ast(state: SourcerorState, jaxpr, fn_name="function"):
     # Generate argument declarations
-    ast_args = [ast.arg(arg=state.str_name(var), annotation=None) for var in jaxpr.invars]
+    annotations = [_astify_jax_typing_annotation(state, v.aval) for v in jaxpr.invars]
+    ast_args = [ast.arg(arg=state.str_name(var), annotation=ann) for var, ann in zip(jaxpr.invars, annotations)]
     ast_args = ast.arguments(args=ast_args, vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[], posonlyargs=[])
 
     stmts = []
@@ -218,10 +287,17 @@ def jaxpr_to_py_ast(state: SourcerorState, jaxpr, fn_name="function"):
     if len(jaxpr.outvars) == 1:
         returns = state.name(jaxpr.outvars[0])
     else:
-        returns = ast.Tuple(elts=[state.name(var) for var in jaxpr.outvars], ctx=ast.Load())
+        returns = ast.Tuple(elts=[_name_or_literal(state, var) for var in jaxpr.outvars], ctx=ast.Load())
     stmts.append(ast.Return(value=returns))
 
     return ast.FunctionDef(name=fn_name, args=ast_args, body=stmts, decorator_list=[])
+
+
+def _name_or_literal(state, var):
+    if isinstance(var, Literal):
+        return _astify_value(var.val)
+    else:
+        return state.name(var)
 
 
 def constant_fold_jaxpr(jaxpr: jax.core.Jaxpr):
@@ -304,6 +380,10 @@ def _eval_eqn(eqn, vals) -> Union[Jaxpr, tuple, list, jnp.ndarray]:
         out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr, {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
     elif eqn.primitive.name == "scan":
         out = eqn.primitive.bind(*vals, **eqn.params)
+    elif isinstance(eqn.primitive, CustomJVPCallPrimitive):
+        # out = eqn.primitive.bind(*vals, **eqn.params)
+        closed_jaxpr = eqn.params['call_jaxpr']
+        out = partial_eval_jaxpr(closed_jaxpr.jaxpr, {var: val for var, val in zip(closed_jaxpr.jaxpr.invars, vals)})
     else:
         out = eqn.primitive.bind(*vals, **eqn.params)
     return out
@@ -328,12 +408,56 @@ def _astify_dot_general(state, eqn):
 
         return out
 
-    # TODO: convert to einsum?
+    # handle einsum case
+    contract_dims, batch_dims = d
+    in_specs = [['0']*x.aval.ndim, ['0']*y.aval.ndim]  # the 0's will be replaced with letters
+    out_spec = ''
+    letter = ord('a')
 
-    invars = [_astify_atom(state, x), _astify_atom(state, y), _astify_value(d), _astify_value(precision),
-             _astify_value(preferred_element_type)]
+    # output ordering is batch dims in order, then remaining lhs, then remaining rhs
+    for i in range(len(batch_dims[0])):
+        in_specs[0][batch_dims[0][i]] = chr(letter)
+        in_specs[1][batch_dims[1][i]] = chr(letter)
+        out_spec += chr(letter)
+        letter += 1
+
+    for i in range(len(contract_dims[0])):
+        in_specs[0][contract_dims[0][i]] = chr(letter)
+        in_specs[1][contract_dims[1][i]] = chr(letter)
+        letter += 1
+
+    # remaining dims are just the rest of the dims
+    for i in range(x.aval.ndim):
+        if in_specs[0][i] == '0':
+            in_specs[0][i] = chr(letter)
+            out_spec += chr(letter)
+            letter += 1
+
+    for i in range(y.aval.ndim):
+        if in_specs[1][i] == '0':
+            in_specs[1][i] = chr(letter)
+            out_spec += chr(letter)
+            letter += 1
+
+
+
+    final_spec = f"{''.join(in_specs[0])},{''.join(in_specs[1])}->{out_spec}"
+    invars = [_astify_value(final_spec), _astify_atom(state, x), _astify_atom(state, y)]
     outvars = _astify_outvars(state, eqn.outvars)
-    return ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.lax', ctx=ast.Load()), attr='dot_general', ctx=ast.Load()), args=invars, keywords=[]))
+    keywords = []
+    if precision is not None:
+        keywords.append(ast.keyword(arg='precision', value=_astify_value(precision)))
+    if preferred_element_type is not None:
+        keywords.append(ast.keyword(arg='preferred_element_type', value=_astify_value(preferred_element_type)))
+
+    return ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.numpy', ctx=ast.Load()), attr='einsum', ctx=ast.Load()), args=invars,
+                                                      keywords=keywords))
+
+
+    # invars = [_astify_atom(state, x), _astify_atom(state, y), _astify_value(d), _astify_value(precision),
+    #          _astify_value(preferred_element_type)]
+    # outvars = _astify_outvars(state, eqn.outvars)
+    # return ast.Assign(targets=outvars, value=ast.Call(func=ast.Attribute(value=ast.Name(id='jax.lax', ctx=ast.Load()), attr='dot_general', ctx=ast.Load()), args=invars, keywords=[]))
 
 @primitive_handler('dynamic_slice')
 def _sourcify_dynamic_slice(state, eqn):
@@ -486,7 +610,23 @@ def _astify_value(value):
         return ast.Attribute(value=ast.Name(id='jax.experimental.pjit', ctx=ast.Load()), attr='_UNSPECIFIED', ctx=ast.Load())
     elif isinstance(value, enum.Enum):
         return ast.Attribute(value=ast.Name(id=value.__class__.__qualname__, ctx=ast.Load()), attr=value.name, ctx=ast.Load())
-
+    elif isinstance(value, slice):
+        return ast.Call(
+            func=ast.Name(id='slice', ctx=ast.Load()),
+            args=[_astify_value(value.start), _astify_value(value.stop), _astify_value(value.step)],
+            keywords=[]
+        )
+    elif isinstance(value, NamedSharding):
+        # jax.sharding.NamedSharding(mesh=<recurse>, spec=PartitionSpec(*<recurse>)
+        return ast.Call(
+            func=ast.Attribute(value=ast.Name(id='jax.sharding', ctx=ast.Load()), attr='NamedSharding', ctx=ast.Load()),
+            args=[_astify_value(value.mesh), _astify_value(value.spec)],
+            keywords=[]
+        )
+    elif isinstance(value, jax.sharding.Mesh):
+        return ast.Load(name="TODO_mesh")
+    elif isinstance(value, jax.sharding.PartitionSpec):
+        return ast.Load(name="TODO_partition_spec")
     else:
         warnings.warn(f"Unknown value type {type(value)}")
         return ast.parse(repr(value)).body[0]
@@ -548,7 +688,7 @@ def _astify_scan(state, eqn):
     else:
         jaxpr = constant_fold_jaxpr(jaxpr.jaxpr)
 
-    fn_name = state.skolem('fn')
+    fn_name = state.heuristic_fn_skolem(jaxpr)
     fn_ast = jaxpr_to_py_ast(state, jaxpr, fn_name)
 
     length = _astify_value(eqn.params['length'])
@@ -676,16 +816,35 @@ def _astify_map(state, eqn):
     return [fn_ast, assign]
 
 
+def _attempt_to_sniff_fn_name_for_jaxpr(jaxpr):
+    # this is necessarily very hacky.
+    eqns = jaxpr.eqns
+    if len(eqns) == 0:
+        return None
+    source_info = eqns[0].source_info
+    try:
+        frame = user_frame(source_info)
+        name = frame.function_name
+        if not name:
+            name = frame.file_name
+        return name
+    except:
+        return None
+
+
+
+
+
 @primitive_handler('closed_call')
 def _astify_closed_call(state, eqn):
     # out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr,
     #                          {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
     raw_jaxpr = eqn.params['call_jaxpr'].jaxpr
     literal_args = {k: v.val for k, v in zip(raw_jaxpr.invars, eqn.invars) if isinstance(v, Literal)}
-    call_japr = partial_eval_jaxpr(raw_jaxpr, literal_args)
-    fn_name = state.skolem('fn')
+    call_jaxpr = partial_eval_jaxpr(raw_jaxpr, literal_args)
+    fn_name = state.heuristic_fn_skolem(call_jaxpr)
 
-    fn_ast = jaxpr_to_py_ast(state, call_japr, fn_name)
+    fn_ast = jaxpr_to_py_ast(state, call_jaxpr, fn_name)
 
     invars = [_astify_atom(state, v) for v in eqn.invars if not isinstance(v, Literal)]
     outvars = _astify_outvars(state, eqn.outvars)
@@ -725,13 +884,15 @@ def _astify_pjit(state, eqn):
     fn_name = state.skolem(name)
     fn_ast = jaxpr_to_py_ast(state, jaxpr, fn_name)
 
-    in_shardings = _astify_value(in_shardings)
-    out_shardings = _astify_value(out_shardings)
+    keywords = []
 
-    keywords = [
-        ast.keyword(arg='in_shardings', value=in_shardings),
-        ast.keyword(arg='out_shardings', value=out_shardings),
-    ]
+    if in_shardings and any(s != jax.experimental.pjit._UNSPECIFIED for s in in_shardings):
+        in_shardings = _astify_value(in_shardings)
+        keywords.append(ast.keyword(arg='in_shardings', value=in_shardings))
+
+    if out_shardings and any(s != jax.experimental.pjit._UNSPECIFIED for s in out_shardings):
+        out_shardings = _astify_value(out_shardings)
+        keywords.append(ast.keyword(arg='out_shardings', value=out_shardings))
 
     if not can_ignore_donated:
         donated_invars = _astify_value(donated_invars)
@@ -742,7 +903,7 @@ def _astify_pjit(state, eqn):
         ast.Attribute(
             ast.Name(id='jax.experimental.pjit', ctx=ast.Load()),
             attr='pjit'),
-        args=[fn_ast],
+        args=[ast.Name(id=fn_name, ctx=ast.Load())],
         keywords=keywords
     )
 
@@ -787,6 +948,177 @@ def _astify_remat(state: SourcerorState, eqn):
         ))
 
     return [fn_ast, lam, assign]
+
+
+@primitive_handler('custom_vjp_call_jaxpr')
+def _astify_custom_vjp_call_jaxpr(state, eqn):
+    # out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr,
+    #                          {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
+    closed_jaxpr = eqn.params['fun_jaxpr']
+    call_jaxpr = constant_fold_jaxpr(closed_jaxpr.jaxpr)
+    fn_name = state.skolem('fn')
+
+    fn_ast = jaxpr_to_py_ast(state, call_jaxpr, fn_name)
+
+    invars = [_astify_atom(state, v) for v in eqn.invars]
+    outvars = _astify_outvars(state, eqn.outvars)
+
+    lam = ast.Assign(
+        targets=[ast.Name(id=f"vjp_{fn_name}", ctx=ast.Store())],
+        value=ast.Lambda(
+            args=ast.arguments(
+                args=[ast.arg(arg='primals')],
+                vararg=None,
+                kwonlyargs=[],
+                kw_defaults=[],
+                kwarg=None,
+                defaults=[],
+                posonlyargs=[]
+            ),
+            body=ast.Call(
+                func=ast.Name(id=fn_name, ctx=ast.Load()),
+                args=[ast.Name(id='primals', ctx=ast.Load())],
+                keywords=[]
+            )
+        )
+    )
+
+    assign = ast.Assign(
+        targets=outvars,
+        value=ast.Call(
+            func=ast.Name(id=f"vjp_{fn_name}", ctx=ast.Load()),
+            args=invars,
+            keywords=[]
+        ))
+
+    return [fn_ast, lam, assign]
+
+
+@primitive_handler('while')
+def _astify_while(state, eqn):
+    # out = partial_eval_jaxpr(eqn.params['call_jaxpr'].jaxpr,
+    #                          {var: val for var, val in zip(eqn.params['call_jaxpr'].jaxpr.invars, vals)})
+    body_jaxpr = eqn.params['body_jaxpr']
+    cond_jaxpr = eqn.params['cond_jaxpr']
+
+    body_jaxpr = constant_fold_jaxpr(body_jaxpr.jaxpr)
+    cond_jaxpr = constant_fold_jaxpr(cond_jaxpr.jaxpr)
+
+    body_fn_name = state.skolem('body_fn')
+    cond_fn_name = state.skolem('cond_fn')
+
+    body_nconsts = eqn.params['body_nconsts']
+    cond_nconsts = eqn.params['cond_nconsts']
+
+    if cond_nconsts != 0:
+        env = dict(zip(cond_jaxpr.invars, eqn.invars[:cond_nconsts]))
+        cond_jaxpr = partial_eval_jaxpr(cond_jaxpr, env)
+
+    cond_fn_ast = jaxpr_to_py_ast(state, cond_jaxpr, cond_fn_name)
+
+    if body_nconsts != 0:
+        env = dict(zip(body_jaxpr.invars, eqn.invars[cond_nconsts:cond_nconsts+body_nconsts]))
+        body_jaxpr = partial_eval_jaxpr(body_jaxpr, env)
+
+    body_fn_ast = jaxpr_to_py_ast(state, body_jaxpr, body_fn_name)
+
+    true_args = eqn.invars[cond_nconsts+body_nconsts:]
+
+    invars = [_astify_atom(state, v) for v in true_args]
+    outvars = _astify_outvars(state, eqn.outvars)
+
+    lam = ast.Assign(
+        targets=[ast.Name(id=f"while_{body_fn_name}", ctx=ast.Store())],
+        value=ast.Lambda(
+            args=ast.arguments(
+                args=[ast.arg(arg='carry'), ast.arg(arg='x')],
+                vararg=None,
+                kwonlyargs=[],
+                kw_defaults=[],
+                kwarg=None,
+                defaults=[],
+                posonlyargs=[]
+            ),
+            body=ast.Call(
+                func=ast.Name(id=body_fn_name, ctx=ast.Load()),
+                args=[ast.Name(id='carry', ctx=ast.Load()), ast.Name(id='x', ctx=ast.Load())],
+                keywords=[]
+            )
+        )
+    )
+
+    cond_lam = ast.Assign(
+        targets=[ast.Name(id=f"while_{cond_fn_name}", ctx=ast.Store())],
+        value=ast.Lambda(
+            args=ast.arguments(
+                args=[ast.arg(arg='carry'), ast.arg(arg='x')],
+                vararg=None,
+                kwonlyargs=[],
+                kw_defaults=[],
+                kwarg=None,
+                defaults=[],
+                posonlyargs=[]
+            ),
+            body=ast.Call(
+                func=ast.Name(id=cond_fn_name, ctx=ast.Load()),
+                args=[ast.Name(id='carry', ctx=ast.Load()), ast.Name(id='x', ctx=ast.Load)],
+                keywords=[]
+            )
+        )
+
+    )
+
+    assign = ast.Assign(
+        targets=outvars,
+        value=ast.Call(
+            func=ast.Name(id='jax.lax.while_loop', ctx=ast.Load()),
+            args=[ast.Name(id=f"while_{cond_fn_name}", ctx=ast.Load()), ast.Name(id=f"while_{body_fn_name}", ctx=ast.Load())] + invars,
+            keywords=[]
+        ))
+
+    return [body_fn_ast, cond_fn_ast, lam, cond_lam, assign]
+
+
+@primitive_handler('iota')
+def _astify_iota(state, eqn):
+    # iota is a sort of broadcasted arange
+    # we can use np.broadcast_to(np.arange(size), shape)
+    dimension = eqn.params['dimension']  # axis along which to increment.
+    shape = eqn.params['shape']
+    dtype = eqn.params['dtype']
+
+    arange = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id='jax.numpy', ctx=ast.Load()),
+                    attr='arange',
+                    ctx=ast.Load()
+                ),
+                args=[_astify_value(shape[0])],
+                keywords=[ast.keyword(arg='dtype', value=_astify_value(dtype))]
+    )
+
+    if len(shape) == 1:
+        # this is a simple arange
+        return ast.Assign(
+            targets=_astify_outvars(state, eqn.outvars),
+            value=arange
+        )
+
+    broadcast = ast.Call(
+        func=ast.Attribute(
+            value=ast.Name(id='jax.numpy', ctx=ast.Load()),
+            attr='broadcast_to',
+            ctx=ast.Load()
+        ),
+        args=[arange, _astify_value(shape)],
+        keywords=[]
+    )
+
+    return ast.Assign(
+        targets=_astify_outvars(state, eqn.outvars),
+        value=broadcast
+    )
+
 
 
 @primitive_handler('reshape')
@@ -888,4 +1220,5 @@ def _astify_random_wrap(state, eqn):
 constant_fold_blacklist = {
     'broadcast_in_dim',
     'broadcast',
+    'iota',
 }
