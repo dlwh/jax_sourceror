@@ -2,6 +2,8 @@ import functools
 import textwrap
 from functools import partial
 
+import pytest
+
 from jax_sourceror.interpreter import sourcerize
 import jax
 import jaxtyping
@@ -222,7 +224,7 @@ def test_einsum():
     assert source.strip() == \
     textwrap.dedent("""
     def f(a: Int32[Array, '2 2 2'], b: Int32[Array, '2 2 2']):
-    c = jax.numpy.einsum('acb,abd->cd', a, b, preferred_element_type=jax.numpy.int32)
+    c = jnp.einsum('acb,abd->cd', a, b, preferred_element_type=jax.numpy.int32)
     return c""".strip())
 
 
@@ -272,6 +274,34 @@ def test_switch():
     x = jnp.array(1)
 
     check_roundtrip(f)(x)
+
+
+def test_gather():
+    def f(x, y):
+        return x[y]
+
+    x = jnp.arange(8).reshape(2, 2, 2)
+    y = jnp.array([0, 1])
+
+    check_roundtrip(f)(x, y)
+
+@pytest.mark.parametrize('fn', [jnp.cumsum, jnp.cumprod])
+def test_cumulative(fn):
+    def f(x):
+        return fn(x, axis=0)
+
+    x = jnp.arange(8).reshape(2, 2, 2) + 3
+
+    check_roundtrip(f)(x)
+
+def test_concatenate():
+    def f(x, y):
+        return jnp.concatenate([x, y], axis=0)
+
+    x = jnp.arange(8).reshape(2, 2, 2)
+    y = jnp.arange(8).reshape(2, 2, 2)
+
+    check_roundtrip(f)(x, y)
 
 
 

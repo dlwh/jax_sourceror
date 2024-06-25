@@ -182,21 +182,116 @@ register_prim_handler('add', _binop_fn(ast.Add()))
 register_prim_handler('sub', _binop_fn(ast.Sub()))
 register_prim_handler('mul', _binop_fn(ast.Mult()))
 register_prim_handler('div', _binop_fn(ast.Div()))
-register_prim_handler('neg', normal_fn('jax.lax.neg'))
 register_prim_handler('lt', _cmpop_fn(ast.Lt()))
 register_prim_handler('gt', _cmpop_fn(ast.Gt()))
 register_prim_handler('le', _cmpop_fn(ast.LtE()))
 register_prim_handler('ge', _cmpop_fn(ast.GtE()))
 register_prim_handler('eq', _cmpop_fn(ast.Eq()))
 register_prim_handler('ne', _cmpop_fn(ast.NotEq()))
-register_prim_handler('min', normal_fn('jax.lax.min'))
-register_prim_handler('max', normal_fn('jax.lax.max'))
-register_prim_handler('select_n', normal_fn('jax.lax.select_n'))
-register_prim_handler('squeeze', normal_fn('jax.lax.squeeze'))
-register_prim_handler('broadcast', normal_fn('jax.lax.broadcast'))
-register_prim_handler('reduce_sum', _reduce_fn('jax.numpy.sum'))
-register_prim_handler('transpose', normal_fn('jax.lax.transpose'))
-register_prim_handler('clamp', normal_fn('jax.lax.clamp'))
+# register_prim_handler('min', normal_fn('jax.lax.min'))
+# register_prim_handler('max', normal_fn('jax.lax.max'))
+# register_prim_handler('select_n', normal_fn('jax.lax.select_n'))
+# register_prim_handler('squeeze', normal_fn('jax.lax.squeeze'))
+# register_prim_handler('broadcast', normal_fn('jax.lax.broadcast'))
+# register_prim_handler('reduce_sum', _reduce_fn('jnp.sum'))
+# register_prim_handler('transpose', normal_fn('jax.lax.transpose'))
+# register_prim_handler('clamp', normal_fn('jax.lax.clamp'))
+
+normal_fns = {
+    'min': 'jax.lax.min',
+    'max': 'jax.lax.max',
+    'select_n': 'jax.lax.select_n',
+    'squeeze': 'jax.lax.squeeze',
+    'broadcast': 'jax.lax.broadcast',
+    'transpose': 'jax.lax.transpose',
+    'clamp': 'jax.lax.clamp',
+    'reduce_sum': 'jnp.sum',
+    # misc jax.lax functions
+    'neg': 'jnp.negative',
+    'abs': 'jnp.abs',
+    'sin': 'jnp.sin',
+    'cos': 'jnp.cos',
+    'tan': 'jnp.tan',
+    'asin': 'jnp.arcsin',
+    'acos': 'jnp.arccos',
+    'atan': 'jnp.arctan',
+    'sinh': 'jnp.sinh',
+    'cosh': 'jnp.cosh',
+    'tanh': 'jnp.tanh',
+    'asinh': 'jnp.arcsinh',
+    'acosh': 'jnp.arccosh',
+    'atanh': 'jnp.arctanh',
+    'exp': 'jnp.exp',
+    'log': 'jnp.log',
+    'log1p': 'jnp.log1p',
+    'expm1': 'jnp.expm1',
+    'sqrt': 'jnp.sqrt', 
+    'square': 'jnp.square',
+    'reciprocal': 'jnp.reciprocal',
+    'sign': 'jnp.sign',
+    'rsqrt': 'jax.lax.rsqrt',
+    # 'concatenate': 'jnp.concatenate',
+}
+
+
+
+for k, v in normal_fns.items():
+    register_prim_handler(k, normal_fn(v))
+
+
+@primitive_handler('cumsum')
+def _astify_cumsum(state, eqn):
+    invars = [_astify_atom(state, v) for v in eqn.invars]
+    outvars = _astify_outvars(state, eqn.outvars)
+    axis = eqn.params['axis']
+    reverse = eqn.params['reverse']
+
+    if reverse:
+        return ast.Assign(outvars, ast.Call(
+            func=ast.Name(id='jax.lax.cumsum', ctx=ast.Load()),
+            args=[invars[0]],
+            keywords=[ast.keyword(arg='axis', value=_astify_value(axis)), ast.keyword(arg='reverse', value=ast.NameConstant(value=True))]
+        ))
+    else:
+        return ast.Assign(outvars, ast.Call(
+            func=ast.Name(id='jnp.cumsum', ctx=ast.Load()),
+            args=[invars[0]],
+            keywords=[ast.keyword(arg='axis', value=_astify_value(axis))]
+        ))
+
+
+@primitive_handler('cumprod')
+def _astify_cumprod(state, eqn):
+    invars = [_astify_atom(state, v) for v in eqn.invars]
+    outvars = _astify_outvars(state, eqn.outvars)
+    axis = eqn.params['axis']
+    reverse = eqn.params['reverse']
+
+    if reverse:
+        return ast.Assign(outvars, ast.Call(
+            func=ast.Name(id='jax.lax.cumprod', ctx=ast.Load()),
+            args=[invars[0]],
+            keywords=[ast.keyword(arg='axis', value=_astify_value(axis)), ast.keyword(arg='reverse', value=ast.NameConstant(value=True))]
+        ))
+    else:
+        return ast.Assign(outvars, ast.Call(
+            func=ast.Name(id='jnp.cumprod', ctx=ast.Load()),
+            args=[invars[0]],
+            keywords=[ast.keyword(arg='axis', value=_astify_value(axis))]
+        ))
+
+
+@primitive_handler('concatenate')
+def _astify_concatenate(state, eqn):
+    invars = [_astify_atom(state, v) for v in eqn.invars]
+    outvars = _astify_outvars(state, eqn.outvars)
+    axis = eqn.params['dimension']
+    return ast.Assign(outvars, ast.Call(
+        func=ast.Attribute(value=ast.Name(id='jnp', ctx=ast.Load()), attr='concatenate', ctx=ast.Load()),
+        args=[ast.Tuple(elts=invars, ctx=ast.Load())],
+        keywords=[ast.keyword(arg='axis', value=_astify_value(axis))]
+    ))
+
 
 
 def _maybe_wrap_fn_for_leaves(node, f, num_args):
@@ -1180,7 +1275,7 @@ def _astify_reshape(state, eqn):
 
     if dimensions is not None:
         source = ast.Call(
-            func=ast.Name(id='jax.numpy.transpose', ctx=ast.Load()),
+            func=ast.Name(id='jnp.transpose', ctx=ast.Load()),
             args=[source, _astify_value(dimensions)],
             keywords=[]
         )
@@ -1188,7 +1283,7 @@ def _astify_reshape(state, eqn):
     assign = ast.Assign(
         targets=_astify_outvars(state, eqn.outvars),
         value=ast.Call(
-            func=ast.Name(id='jax.numpy.reshape', ctx=ast.Load()),
+            func=ast.Name(id='jnp.reshape', ctx=ast.Load()),
             args=[source, _astify_value(new_sizes)],
             keywords=[]
         ))
