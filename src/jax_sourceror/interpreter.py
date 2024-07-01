@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax._src.core import ClosedJaxpr
-from jax._src.source_info_util import user_frame
+from jax._src.source_info_util import user_frame, user_frames
 from jax.sharding import NamedSharding
 from jax._src.custom_derivatives import CustomJVPCallPrimitive
 from jax.experimental.pjit import _UNSPECIFIED
@@ -44,8 +44,9 @@ class SourcerorState():
 
             name = name[::-1]
 
-            if name == "or":
-                name = "or_"  # or is a keyword
+            if name in ['def', 'if', 'or', 'and', 'not', 'for', 'as', 'in', 'is']:
+                name = f"{name}_"
+
 
             self._var_names[var] = name
 
@@ -206,7 +207,12 @@ normal_fns = {
     'transpose': 'jax.lax.transpose',
     'clamp': 'jax.lax.clamp',
     'reduce_sum': 'jnp.sum',
+    'reduce_max': 'jnp.max',
+    'reduce_min': 'jnp.min',
+    'is_finite': 'jnp.isfinite',
     # misc jax.lax functions
+    'integer_pow': 'jax.lax.integer_pow',
+    'stop_gradient': 'jax.lax.stop_gradient',
     'neg': 'jnp.negative',
     'abs': 'jnp.abs',
     'sin': 'jnp.sin',
@@ -718,6 +724,8 @@ def _astify_value(value):
             return ast.Call(func=ast.Attribute(value=ast.Name(id="jnp", ctx=ast.Load()), attr='dtype', ctx=ast.Load()), args=[ast.Constant(value=str(value))], keywords=[])
     elif value is _UNSPECIFIED:
         return ast.Attribute(value=ast.Name(id='jax.experimental.pjit', ctx=ast.Load()), attr='_UNSPECIFIED', ctx=ast.Load())
+    elif isinstance(value, jax.lax.GatherScatterMode):
+        return ast.Attribute(value=ast.Name("jax.lax.GatherScatterMode", ctx=ast.Load()), attr=value.name, ctx=ast.Load())
     elif isinstance(value, enum.Enum):
         return ast.Attribute(value=ast.Name(id=value.__class__.__qualname__, ctx=ast.Load()), attr=value.name, ctx=ast.Load())
     elif isinstance(value, slice):
@@ -922,8 +930,13 @@ def _attempt_to_sniff_fn_name_for_jaxpr(jaxpr):
         return None
     source_info = eqns[0].source_info
     try:
-        frame = user_frame(source_info)
-        name = frame.function_name
+        name = None
+        for frame in user_frames(source_info):
+            name = frame.function_name
+
+            if name and "<" not in name:
+                return name
+
         if not name:
             name = frame.file_name
         return name
@@ -977,10 +990,6 @@ def _astify_pjit(state, eqn):
 
     can_ignore_donated = not any(donated_invars)
 
-    # preprocess the function
-    fn_ast = jaxpr_to_py_ast(state, jaxpr, name)
-    fn_name = fn_ast.name
-
     keywords = []
 
     if in_shardings and any(s != jax.experimental.pjit._UNSPECIFIED for s in in_shardings):
@@ -995,11 +1004,16 @@ def _astify_pjit(state, eqn):
         donated_invars = _astify_value(donated_invars)
         keywords.append(ast.keyword(arg='donated_invars', value=donated_invars))
 
+
+    # preprocess the function
+    fn_ast = jaxpr_to_py_ast(state, jaxpr)
+    fn_name = fn_ast.name
+
     jitted_fn = ast.Call(
         func=
         ast.Attribute(
-            ast.Name(id='jax.experimental.pjit', ctx=ast.Load()),
-            attr='pjit'),
+            ast.Name(id='jax', ctx=ast.Load()),
+            attr='jit'),
         args=[ast.Name(id=fn_name, ctx=ast.Load())],
         keywords=keywords
     )
@@ -1096,6 +1110,61 @@ def _astify_custom_vjp_call_jaxpr(state, eqn):
         ))
 
     return [fn_ast, lam, assign]
+
+
+@primitive_handler('custom_jvp_call')
+def _astify_custom_jvp_call(state, eqn):
+    closed_jaxpr = eqn.params['call_jaxpr']
+    fn_ast = jaxpr_to_py_ast(state, closed_jaxpr)
+    fn_name = fn_ast.name
+
+    invars = [_astify_atom(state, v) for v in eqn.invars]
+    outvars = _astify_outvars(state, eqn.outvars)
+
+    # lam = ast.Assign(
+    #     targets=[ast.Name(id=f"jvp_{fn_name}", ctx=ast.Store())],
+    #     value=ast.Lambda(
+    #         args=ast.arguments(
+    #             args=[ast.arg(arg='primals', annotation=None), ast.arg(arg='tangents', annotation=None)],
+    #             vararg=None,
+    #             kwonlyargs=[],
+    #             kw_defaults=[],
+    #             kwarg=None,
+    #             defaults=[],
+    #             posonlyargs=[]
+    #         ),
+    #         body=ast.Call(
+    #             func=ast.Name(id=fn_name, ctx=ast.Load()),
+    #             args=[ast.Name(id='primals', ctx=ast.Load()), ast.Name(id='tangents', ctx=ast.Load())],
+    #             keywords=[]
+    #         )
+    #     )
+    # )
+    #
+    # assign = ast.Assign(
+    #     targets=outvars,
+    #     value=ast.Call(
+    #         func=ast.Name(id=f"jvp_{fn_name}", ctx=ast.Load()),
+    #         args=invars,
+    #         keywords=[]
+    #     ))
+
+    # return [fn_ast, lam, assign]
+
+    # just call the fn
+
+    assign = ast.Assign(
+        targets=outvars,
+        value=ast.Call(
+            func=ast.Name(id=fn_name, ctx=ast.Load()),
+            args=invars,
+            keywords=[]
+        ))
+
+    return [fn_ast, assign]
+
+
+
 
 
 @primitive_handler('while')
