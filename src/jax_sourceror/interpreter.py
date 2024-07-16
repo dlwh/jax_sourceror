@@ -194,7 +194,7 @@ register_prim_handler('ne', _cmpop_fn(ast.NotEq()))
 # register_prim_handler('select_n', normal_fn('jax.lax.select_n'))
 # register_prim_handler('squeeze', normal_fn('jax.lax.squeeze'))
 # register_prim_handler('broadcast', normal_fn('jax.lax.broadcast'))
-# register_prim_handler('reduce_sum', _reduce_fn('jnp.sum'))
+register_prim_handler('reduce_sum', _reduce_fn('jnp.sum'))
 # register_prim_handler('transpose', normal_fn('jax.lax.transpose'))
 # register_prim_handler('clamp', normal_fn('jax.lax.clamp'))
 
@@ -206,7 +206,7 @@ normal_fns = {
     'broadcast': 'jax.lax.broadcast',
     'transpose': 'jax.lax.transpose',
     'clamp': 'jax.lax.clamp',
-    'reduce_sum': 'jnp.sum',
+    # 'reduce_sum': 'jnp.sum',
     'reduce_max': 'jnp.max',
     'reduce_min': 'jnp.min',
     'is_finite': 'jnp.isfinite',
