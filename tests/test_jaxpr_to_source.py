@@ -224,7 +224,7 @@ def test_einsum():
     assert source.strip() == \
     textwrap.dedent("""
     def f(a: Int32[Array, '2 2 2'], b: Int32[Array, '2 2 2']):
-    c = jnp.einsum('acb,abd->cd', a, b, preferred_element_type=jax.numpy.int32)
+    c = jnp.einsum('acb,abd->cd', a, b, preferred_element_type=jnp.int32)
     return c""".strip())
 
 

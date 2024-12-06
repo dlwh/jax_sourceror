@@ -389,7 +389,10 @@ def jaxpr_to_py_ast(state: SourcerorState, jaxpr, fn_name: Optional[str] = None,
         if prim in prim_to_python:
             eqn_stmts = prim_to_python[prim](state, eqn)
         else:
-            eqn_stmts = normal_fn(prim)(state, eqn)
+            try:
+                eqn_stmts = normal_fn(prim)(state, eqn)
+            except Exception:
+                raise ValueError(f"Could not handle primitive {prim}")
 
         if isinstance(eqn_stmts, list):
             stmts.extend(eqn_stmts)
@@ -745,8 +748,11 @@ def _astify_value(value):
         return ast.Load(name="TODO_mesh")
     elif isinstance(value, jax.sharding.PartitionSpec):
         return ast.Load(name="TODO_partition_spec")
+    elif isinstance(value, bytes):
+        return ast.Constant(value=value.decode('utf-8'))
     else:
         warnings.warn(f"Unknown value type {type(value)}")
+        raise NotImplementedError(f"Unknown value type {type(value)}")
         return ast.parse(repr(value)).body[0]
 
 
@@ -1178,15 +1184,15 @@ def _astify_while(state, eqn):
     cond_nconsts = eqn.params['cond_nconsts']
 
     if cond_nconsts != 0:
-        env = dict(zip(cond_jaxpr.invars, eqn.invars[:cond_nconsts]))
-        cond_jaxpr = partial_eval_jaxpr(cond_jaxpr, env, elide_unused_invars=False)
+        env = dict(zip(cond_jaxpr.in_avals, eqn.invars[:cond_nconsts]))
+        cond_jaxpr = partial_eval_jaxpr(cond_jaxpr.jaxpr, env, elide_unused_invars=False)
 
     cond_fn_ast = jaxpr_to_py_ast(state, cond_jaxpr)
     cond_fn_name = cond_fn_ast.name
 
     if body_nconsts != 0:
-        env = dict(zip(body_jaxpr.invars, eqn.invars[cond_nconsts:cond_nconsts+body_nconsts]))
-        body_jaxpr = partial_eval_jaxpr(body_jaxpr, env, elide_unused_invars=False)
+        env = dict(zip(body_jaxpr.in_avals, eqn.invars[cond_nconsts:cond_nconsts+body_nconsts]))
+        body_jaxpr = partial_eval_jaxpr(body_jaxpr.jaxpr, env, elide_unused_invars=False)
 
     body_fn_ast = jaxpr_to_py_ast(state, body_jaxpr)
     body_fn_name = body_fn_ast.name
